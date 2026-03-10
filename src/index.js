@@ -216,7 +216,11 @@ async function resolvePlex(imdbId, meta) {
       { headers: { 'Accept': 'application/json', 'X-Plex-Token': authToken } }
     );
     const extrasData = await extrasRes.json();
-    const trailer = extrasData.MediaContainer?.Metadata?.find(m => m.subtype === 'trailer');
+    const extras = extrasData.MediaContainer?.Metadata || [];
+    // Prefer full trailers, fall back to teasers/clips/BTS if no trailer exists
+    const trailer = extras.find(m => m.subtype === 'trailer' && !/teaser|clip|behind|featurette/i.test(m.title))
+      || extras.find(m => m.subtype === 'trailer')
+      || extras[0];
     const url = trailer?.Media?.[0]?.url;
 
     if (url) {
@@ -262,12 +266,17 @@ async function resolveRottenTomatoes(imdbId, meta) {
 
     if (!Array.isArray(videos) || videos.length === 0) return null;
 
-    // Find trailers
-    const trailers = videos.filter(v => v.videoType === 'TRAILER');
-    if (trailers.length === 0) return null;
+    // Sort: full trailers first, then teasers, then clips/BTS as fallback
+    const priority = v => {
+      const t = (v.title || '').toLowerCase();
+      if (v.videoType === 'TRAILER' && !t.includes('teaser') && !t.includes('clip') && !t.includes('behind') && !t.includes('featurette')) return 0;
+      if (v.videoType === 'TRAILER') return 1;
+      return 2;
+    };
+    videos.sort((a, b) => priority(a) - priority(b));
 
     // Try to resolve via SMIL to get direct fandango.com URL
-    for (const trailer of trailers) {
+    for (const trailer of videos) {
       if (!trailer.file) continue;
 
       let videoUrl = trailer.file;
@@ -411,7 +420,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v20:${imdbId}`;
+  const cacheKey = `trailer:v21:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
