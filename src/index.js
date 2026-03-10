@@ -165,7 +165,7 @@ async function resolveAppleTV(imdbId, meta) {
     const pick = withContext.find(v => v.ctx.includes('trailer') && !/teaser|clip|behind|featurette/i.test(v.ctx))
       || withContext.find(v => v.ctx.includes('trailer'))
       || withContext[0];
-    const trailerUrl = pick?.url || hlsMatches[0]?.[0];
+    const trailerUrl = pick?.url;
 
     if (trailerUrl) {
       const cleanUrl = trailerUrl.replace(/&amp;/g, '&');
@@ -274,11 +274,13 @@ async function resolveRottenTomatoes(imdbId, meta) {
     if (!Array.isArray(videos) || videos.length === 0) return null;
 
     // Sort: full trailers first, then teasers, then clips/BTS as fallback
+    const junk = /teaser|clip|behind|featurette|sneak peek|opening|sequence/i;
     const priority = v => {
       const t = (v.title || '').toLowerCase();
-      if (v.videoType === 'TRAILER' && !t.includes('teaser') && !t.includes('clip') && !t.includes('behind') && !t.includes('featurette')) return 0;
-      if (v.videoType === 'TRAILER') return 1;
-      return 2;
+      if (v.videoType === 'TRAILER' && t.includes('trailer') && !junk.test(t)) return 0;
+      if (v.videoType === 'TRAILER' && !junk.test(t)) return 1;
+      if (v.videoType === 'TRAILER') return 2;
+      return 3;
     };
     videos.sort((a, b) => priority(a) - priority(b));
 
@@ -427,7 +429,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v21:${imdbId}`;
+  const cacheKey = `trailer:v22:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
