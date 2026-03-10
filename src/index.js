@@ -3,9 +3,9 @@
 
 const MANIFEST = {
   id: 'io.trailerio.lite',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'Trailerio',
-  description: 'Trailer addon - Apple TV, Rotten Tomatoes, Plex, IMDb',
+  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, IMDb',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
   resources: [
     {
@@ -35,6 +35,26 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
     clearTimeout(id);
     throw e;
   }
+}
+
+// ============== SMIL PARSER ==============
+
+// Parse SMIL XML and return best quality video (highest bitrate)
+function parseSMIL(smilXml) {
+  const videoTags = [...smilXml.matchAll(/<video[^>]+src="(https:\/\/video\.fandango\.com[^"]+\.mp4)"[^>]*/g)];
+  const videos = videoTags.map(m => {
+    const tag = m[0];
+    const heightMatch = tag.match(/height="(\d+)"/);
+    const bitrateMatch = tag.match(/system-bitrate="(\d+)"/);
+    return {
+      url: m[1],
+      height: heightMatch ? parseInt(heightMatch[1]) : 0,
+      bitrate: bitrateMatch ? Math.round(parseInt(bitrateMatch[1]) / 1000) : 0
+    };
+  });
+  if (videos.length === 0) return null;
+  videos.sort((a, b) => b.bitrate - a.bitrate || b.height - a.height);
+  return videos[0];
 }
 
 // ============== TMDB METADATA ==============
@@ -83,7 +103,7 @@ async function getTMDBMetadata(imdbId, type = 'movie') {
   }
 }
 
-// Get Apple TV / RT IDs from Wikidata entity
+// Get Apple TV / RT / Fandango IDs from Wikidata entity
 async function getWikidataIds(wikidataId) {
   if (!wikidataId) return {};
 
@@ -104,7 +124,8 @@ async function getWikidataIds(wikidataId) {
     return {
       appleTvId: appleTvMovieId || appleTvShowId,
       isAppleTvShow: !!appleTvShowId && !appleTvMovieId,
-      rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value
+      rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value,
+      fandangoId: entity.claims?.P5693?.[0]?.mainsnak?.datavalue?.value
     };
   } catch (e) {
     return {};
@@ -140,7 +161,24 @@ async function resolveAppleTV(imdbId, meta) {
     const trailerUrl = hlsMatches.find(u => !u.includes('subscription')) || hlsMatches[0];
 
     if (trailerUrl) {
-      return { url: trailerUrl.replace(/&amp;/g, '&'), provider: 'Apple TV 1080p' };
+      const cleanUrl = trailerUrl.replace(/&amp;/g, '&');
+
+      // Fetch m3u8 to get actual BANDWIDTH from master playlist
+      try {
+        const m3u8Res = await fetchWithTimeout(cleanUrl, {}, 5000);
+        const m3u8Text = await m3u8Res.text();
+        const streamMatches = [...m3u8Text.matchAll(/#EXT-X-STREAM-INF:.*?BANDWIDTH=(\d+)(?:.*?RESOLUTION=(\d+)x(\d+))?/g)];
+        if (streamMatches.length > 0) {
+          streamMatches.sort((a, b) => parseInt(b[1]) - parseInt(a[1]));
+          const maxBandwidth = parseInt(streamMatches[0][1]);
+          const height = streamMatches[0][3] ? parseInt(streamMatches[0][3]) : 0;
+          const bitrate = Math.round(maxBandwidth / 1000);
+          const quality = height >= 2160 ? '4K' : height >= 1080 ? '1080p' : height >= 720 ? '720p' : '1080p';
+          return { url: cleanUrl, provider: `Apple TV ${quality}`, bitrate };
+        }
+      } catch (e) { /* m3u8 parse failed, still return URL */ }
+
+      return { url: cleanUrl, provider: 'Apple TV', bitrate: 0 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -181,7 +219,9 @@ async function resolvePlex(imdbId, meta) {
     const url = trailer?.Media?.[0]?.url;
 
     if (url) {
-      return { url, provider: 'Plex 1080p' };
+      const kbrateMatch = url.match(/videokbrate=(\d+)/);
+      const bitrate = kbrateMatch ? parseInt(kbrateMatch[1]) : 5000;
+      return { url, provider: 'Plex 1080p', bitrate };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -241,15 +281,10 @@ async function resolveRottenTomatoes(imdbId, meta) {
 
           if (smilRes.ok) {
             const smilXml = await smilRes.text();
-
-            // Extract video URLs with height from SMIL, pick highest quality
-            const matches = [...smilXml.matchAll(/src="(https:\/\/video\.fandango\.com[^"]+\.mp4)"[^>]*height="(\d+)"/g)];
-            if (matches.length > 0) {
-              matches.sort((a, b) => parseInt(b[2]) - parseInt(a[2]));
-              const bestUrl = matches[0][1];
-              const height = parseInt(matches[0][2]);
-              const quality = height >= 1080 ? '1080p' : `${height}p`;
-              return { url: bestUrl, provider: `Rotten Tomatoes ${quality}` };
+            const best = parseSMIL(smilXml);
+            if (best) {
+              const quality = best.height >= 1080 ? '1080p' : `${best.height}p`;
+              return { url: best.url, provider: `Rotten Tomatoes ${quality}`, bitrate: best.bitrate || 5000 };
             }
           }
         } catch (e) { /* try next trailer */ }
@@ -259,7 +294,57 @@ async function resolveRottenTomatoes(imdbId, meta) {
   return null;
 }
 
-// 4. IMDb - Fallback
+// 4. Fandango - Direct theplatform.com (up to 1080p @ 8Mbps)
+async function resolveFandango(imdbId, meta) {
+  try {
+    const fandangoId = meta?.wikidataIds?.fandangoId;
+    if (!fandangoId) return null;
+
+    // Fetch movie overview page (shorthand URL redirects to canonical)
+    const pageRes = await fetchWithTimeout(
+      `https://www.fandango.com/x-${fandangoId}/movie-overview`,
+      {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        redirect: 'follow'
+      }
+    );
+    if (!pageRes.ok) return null;
+
+    const html = await pageRes.text();
+
+    // Extract jwPlayerData JSON from page
+    const jwMatch = html.match(/jwPlayerData\s*=\s*(\{[\s\S]*?\});/);
+    if (!jwMatch) return null;
+
+    let jwData;
+    try {
+      jwData = JSON.parse(jwMatch[1]);
+    } catch (e) {
+      return null;
+    }
+
+    const contentURL = jwData.contentURL;
+    if (!contentURL || !contentURL.includes('theplatform.com')) return null;
+
+    // Resolve via SMIL for best quality MP4
+    const smilUrl = contentURL.split('?')[0] + '?format=SMIL&formats=mpeg4';
+    const smilRes = await fetchWithTimeout(smilUrl, {
+      headers: { 'Accept': 'application/smil+xml' }
+    }, 5000);
+
+    if (!smilRes.ok) return null;
+
+    const smilXml = await smilRes.text();
+    const best = parseSMIL(smilXml);
+    if (best) {
+      const quality = best.height >= 1080 ? '1080p' : `${best.height}p`;
+      return { url: best.url, provider: `Fandango ${quality}`, bitrate: best.bitrate || 8000 };
+    }
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// 5. IMDb - Fallback
 async function resolveIMDb(imdbId) {
   try {
     const pageRes = await fetchWithTimeout(
@@ -285,7 +370,7 @@ async function resolveIMDb(imdbId) {
 
     const urlMatch = videoHtml.match(/"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/);
     if (urlMatch) {
-      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb 1080p' };
+      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -294,7 +379,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v15:${imdbId}`;
+  const cacheKey = `trailer:v16:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -302,31 +387,35 @@ async function resolveTrailers(imdbId, type, cache) {
 
   // PHASE 1: Start IMDb immediately (needs nothing) + TMDB find in parallel
   const [imdbResult, tmdbMeta] = await Promise.all([
-    resolveIMDb(imdbId).then(r => r ? { ...r, priority: 3 } : null),
+    resolveIMDb(imdbId),
     getTMDBMetadata(imdbId, type)
   ]);
 
   // PHASE 2: Start Plex (needs actualType) + Wikidata lookup in parallel
   const [plexResult, wikidataIds] = await Promise.all([
-    resolvePlex(imdbId, tmdbMeta).then(r => r ? { ...r, priority: 2 } : null),
+    resolvePlex(imdbId, tmdbMeta),
     tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({})
   ]);
 
   const meta = { ...tmdbMeta, wikidataIds };
 
-  // PHASE 3: Start Apple TV + RT in parallel (need Wikidata IDs)
-  const [appleTvResult, rtResult] = await Promise.all([
-    resolveAppleTV(imdbId, meta).then(r => r ? { ...r, priority: 0 } : null),
-    resolveRottenTomatoes(imdbId, meta).then(r => r ? { ...r, priority: 1 } : null)
+  // PHASE 3: Start Apple TV + RT + Fandango in parallel (need Wikidata IDs)
+  const [appleTvResult, rtResult, fandangoResult] = await Promise.all([
+    resolveAppleTV(imdbId, meta),
+    resolveRottenTomatoes(imdbId, meta),
+    resolveFandango(imdbId, meta)
   ]);
 
-  // Collect all results
-  const trailerResults = [appleTvResult, rtResult, plexResult, imdbResult];
-
-  // Filter successful results and sort by priority (first = preferred)
-  const links = trailerResults
+  // Collect all results, sort by bitrate (highest = best quality first)
+  const seen = new Set();
+  const links = [fandangoResult, appleTvResult, rtResult, plexResult, imdbResult]
     .filter(r => r !== null)
-    .sort((a, b) => a.priority - b.priority)
+    .sort((a, b) => b.bitrate - a.bitrate)
+    .filter(r => {
+      if (seen.has(r.url)) return false;
+      seen.add(r.url);
+      return true;
+    })
     .map((r, index) => ({
       trailers: r.url,
       provider: index === 0 ? `⭐ ${r.provider}` : r.provider
