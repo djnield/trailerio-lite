@@ -157,30 +157,33 @@ async function resolveAppleTV(imdbId, meta) {
 
     // Try structured JSON first (Preview items with titles mapped to playlist URLs)
     let trailerUrl = null;
-    const jsonMatch = html.match(/<script[^>]*>(\{[\s\S]*?"Preview"[\s\S]*?\})<\/script>/);
-    if (jsonMatch) {
-      try {
-        const pageData = JSON.parse(jsonMatch[1]);
-        const junk = /teaser|clip|behind|featurette|sneak|opening/i;
-        const entries = [];
-        for (const d of pageData.data || []) {
-          for (const shelf of d?.data?.shelves || []) {
-            const items = shelf.items || [];
-            const playlist = shelf.playlistItems || [];
-            items.forEach((item, i) => {
-              if (item.type === 'Preview' && i < playlist.length) {
-                const url = playlist[i]?.playable?.assets?.hlsUrl;
-                if (url) entries.push({ title: item.title || '', url });
-              }
-            });
+    const jsonStart = html.indexOf('{"data":[');
+    if (jsonStart > -1) {
+      const jsonEnd = html.indexOf('</script>', jsonStart);
+      if (jsonEnd > -1) {
+        try {
+          const pageData = JSON.parse(html.substring(jsonStart, jsonEnd));
+          const junk = /teaser|clip|behind|featurette|sneak|opening/i;
+          const entries = [];
+          for (const d of pageData.data || []) {
+            for (const shelf of d?.data?.shelves || []) {
+              const items = shelf.items || [];
+              const playlist = shelf.playlistItems || [];
+              items.forEach((item, i) => {
+                if (item.type === 'Preview' && i < playlist.length) {
+                  const url = playlist[i]?.playable?.assets?.hlsUrl;
+                  if (url) entries.push({ title: item.title || '', url });
+                }
+              });
+            }
           }
-        }
-        // Prefer: title has "trailer" and no junk > any non-junk > anything
-        const best = entries.find(e => /trailer/i.test(e.title) && !junk.test(e.title))
-          || entries.find(e => !junk.test(e.title))
-          || entries[0];
-        if (best) trailerUrl = best.url;
-      } catch (e) { /* JSON parse failed, fall through */ }
+          // Prefer: title has "trailer" and no junk > any non-junk > anything
+          const best = entries.find(e => /trailer/i.test(e.title) && !junk.test(e.title))
+            || entries.find(e => !junk.test(e.title))
+            || entries[0];
+          if (best) trailerUrl = best.url;
+        } catch (e) { /* JSON parse failed, fall through */ }
+      }
     }
     // Fallback: regex extract m3u8 URLs from HTML
     if (!trailerUrl) {
@@ -450,7 +453,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v23:${imdbId}`;
+  const cacheKey = `trailer:v24:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
