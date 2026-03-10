@@ -155,39 +155,57 @@ async function resolveAppleTV(imdbId, meta) {
     );
     const html = await pageRes.text();
 
-    // Extract m3u8 URLs with surrounding context for type filtering
-    const hlsMatches = [...html.matchAll(/https:\/\/play[^"]*\.m3u8[^"]*/g)];
+    // Extract all m3u8 URLs, sorted by context preference
+    const hlsRaw = [...html.matchAll(/https:\/\/play[^"]*\.m3u8[^"]*/g)];
     const junk = /teaser|clip|behind|featurette|sneak|opening/i;
-    const withContext = hlsMatches.map(m => ({
-      url: m[0],
+    const candidates = hlsRaw.map(m => ({
+      url: m[0].replace(/&amp;/g, '&'),
       ctx: html.substring(Math.max(0, m.index - 500), m.index).toLowerCase()
     }));
-    // Prefer: context has "trailer" without junk > context has "trailer" > first URL
-    const pick = withContext.find(v => v.ctx.includes('trailer') && !junk.test(v.ctx))
-      || withContext.find(v => v.ctx.includes('trailer'))
-      || withContext[0];
-    const trailerUrl = pick?.url;
+    // Sort: full trailer context first, then any trailer context, then rest
+    candidates.sort((a, b) => {
+      const score = v => {
+        if (v.ctx.includes('trailer') && !junk.test(v.ctx)) return 0;
+        if (v.ctx.includes('trailer')) return 1;
+        return 2;
+      };
+      return score(a) - score(b);
+    });
 
-    if (trailerUrl) {
-      const cleanUrl = trailerUrl.replace(/&amp;/g, '&');
-
-      // Fetch m3u8 to get actual BANDWIDTH from master playlist
+    // Try each candidate, skip teasers (<60s) by checking variant playlist duration
+    for (const candidate of candidates) {
       try {
-        const m3u8Res = await fetchWithTimeout(cleanUrl, {}, 5000);
+        const m3u8Res = await fetchWithTimeout(candidate.url, {}, 5000);
         const m3u8Text = await m3u8Res.text();
-        const streamMatches = [...m3u8Text.matchAll(/#EXT-X-STREAM-INF:.*?BANDWIDTH=(\d+)(?:.*?RESOLUTION=(\d+)x(\d+))?/g)];
-        if (streamMatches.length > 0) {
-          streamMatches.sort((a, b) => parseInt(b[1]) - parseInt(a[1]));
-          const maxBandwidth = parseInt(streamMatches[0][1]);
-          const width = streamMatches[0][2] ? parseInt(streamMatches[0][2]) : 0;
-          const height = streamMatches[0][3] ? parseInt(streamMatches[0][3]) : 0;
-          const bitrate = Math.round(maxBandwidth / 1000);
-          const quality = width >= 3840 ? '4K' : width >= 1900 ? '1080p' : width >= 1200 ? '720p' : '1080p';
-          return { url: cleanUrl, provider: `Apple TV ${quality}`, bitrate, width, height };
-        }
-      } catch (e) { /* m3u8 parse failed, still return URL */ }
+        const streamMatches = [...m3u8Text.matchAll(/#EXT-X-STREAM-INF:.*?BANDWIDTH=(\d+)(?:.*?RESOLUTION=(\d+)x(\d+))?.*?\n(.+)/g)];
+        if (streamMatches.length === 0) continue;
 
-      return { url: cleanUrl, provider: 'Apple TV', bitrate: 0, width: 0, height: 0 };
+        streamMatches.sort((a, b) => parseInt(b[1]) - parseInt(a[1]));
+        const maxBandwidth = parseInt(streamMatches[0][1]);
+        const width = streamMatches[0][2] ? parseInt(streamMatches[0][2]) : 0;
+        const height = streamMatches[0][3] ? parseInt(streamMatches[0][3]) : 0;
+        const variantPath = streamMatches[0][4];
+
+        // Check duration from variant playlist to skip teasers
+        if (candidates.length > 1 && variantPath) {
+          try {
+            const variantUrl = new URL(variantPath, candidate.url).href;
+            const varRes = await fetchWithTimeout(variantUrl, {}, 3000);
+            const varText = await varRes.text();
+            const durations = [...varText.matchAll(/#EXTINF:([\d.]+)/g)];
+            const totalSec = durations.reduce((sum, m) => sum + parseFloat(m[1]), 0);
+            if (totalSec < 60) continue; // Skip teasers
+          } catch (e) { /* duration check failed, use it anyway */ }
+        }
+
+        const bitrate = Math.round(maxBandwidth / 1000);
+        const quality = width >= 3840 ? '4K' : width >= 1900 ? '1080p' : width >= 1200 ? '720p' : '1080p';
+        return { url: candidate.url, provider: `Apple TV ${quality}`, bitrate, width, height };
+      } catch (e) { continue; }
+    }
+    // Last resort: return first URL without quality info
+    if (candidates.length > 0) {
+      return { url: candidates[0].url, provider: 'Apple TV', bitrate: 0, width: 0, height: 0 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -430,7 +448,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v25:${imdbId}`;
+  const cacheKey = `trailer:v26:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
