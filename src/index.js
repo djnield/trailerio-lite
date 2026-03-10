@@ -155,41 +155,18 @@ async function resolveAppleTV(imdbId, meta) {
     );
     const html = await pageRes.text();
 
-    // Try structured JSON first (Preview items with titles mapped to playlist URLs)
-    let trailerUrl = null;
-    const jsonStart = html.indexOf('{"data":[');
-    if (jsonStart > -1) {
-      const jsonEnd = html.indexOf('</script>', jsonStart);
-      if (jsonEnd > -1) {
-        try {
-          const pageData = JSON.parse(html.substring(jsonStart, jsonEnd));
-          const junk = /teaser|clip|behind|featurette|sneak|opening/i;
-          const entries = [];
-          for (const d of pageData.data || []) {
-            for (const shelf of d?.data?.shelves || []) {
-              const items = shelf.items || [];
-              const playlist = shelf.playlistItems || [];
-              items.forEach((item, i) => {
-                if (item.type === 'Preview' && i < playlist.length) {
-                  const url = playlist[i]?.playable?.assets?.hlsUrl;
-                  if (url) entries.push({ title: item.title || '', url });
-                }
-              });
-            }
-          }
-          // Prefer: title has "trailer" and no junk > any non-junk > anything
-          const best = entries.find(e => /trailer/i.test(e.title) && !junk.test(e.title))
-            || entries.find(e => !junk.test(e.title))
-            || entries[0];
-          if (best) trailerUrl = best.url;
-        } catch (e) { /* JSON parse failed, fall through */ }
-      }
-    }
-    // Fallback: regex extract m3u8 URLs from HTML
-    if (!trailerUrl) {
-      const hlsMatches = html.match(/https:\/\/play[^"]*\.m3u8[^"]*/g) || [];
-      trailerUrl = hlsMatches[0];
-    }
+    // Extract m3u8 URLs with surrounding context for type filtering
+    const hlsMatches = [...html.matchAll(/https:\/\/play[^"]*\.m3u8[^"]*/g)];
+    const junk = /teaser|clip|behind|featurette|sneak|opening/i;
+    const withContext = hlsMatches.map(m => ({
+      url: m[0],
+      ctx: html.substring(Math.max(0, m.index - 500), m.index).toLowerCase()
+    }));
+    // Prefer: context has "trailer" without junk > context has "trailer" > first URL
+    const pick = withContext.find(v => v.ctx.includes('trailer') && !junk.test(v.ctx))
+      || withContext.find(v => v.ctx.includes('trailer'))
+      || withContext[0];
+    const trailerUrl = pick?.url;
 
     if (trailerUrl) {
       const cleanUrl = trailerUrl.replace(/&amp;/g, '&');
@@ -453,7 +430,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v24:${imdbId}`;
+  const cacheKey = `trailer:v25:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
