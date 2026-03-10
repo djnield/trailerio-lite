@@ -174,11 +174,11 @@ async function resolveAppleTV(imdbId, meta) {
           const height = streamMatches[0][3] ? parseInt(streamMatches[0][3]) : 0;
           const bitrate = Math.round(maxBandwidth / 1000);
           const quality = height >= 2160 ? '4K' : height >= 1080 ? '1080p' : height >= 720 ? '720p' : '1080p';
-          return { url: cleanUrl, provider: `Apple TV ${quality}`, bitrate };
+          return { url: cleanUrl, provider: `Apple TV ${quality}`, bitrate, height };
         }
       } catch (e) { /* m3u8 parse failed, still return URL */ }
 
-      return { url: cleanUrl, provider: 'Apple TV', bitrate: 0 };
+      return { url: cleanUrl, provider: 'Apple TV', bitrate: 0, height: 0 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -221,7 +221,7 @@ async function resolvePlex(imdbId, meta) {
     if (url) {
       const kbrateMatch = url.match(/videokbrate=(\d+)/);
       const bitrate = kbrateMatch ? parseInt(kbrateMatch[1]) : 5000;
-      return { url, provider: 'Plex 1080p', bitrate };
+      return { url, provider: 'Plex 1080p', bitrate, height: 1080 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -284,7 +284,7 @@ async function resolveRottenTomatoes(imdbId, meta) {
             const best = parseSMIL(smilXml);
             if (best) {
               const quality = best.height >= 1080 ? '1080p' : `${best.height}p`;
-              return { url: best.url, provider: `Rotten Tomatoes ${quality}`, bitrate: best.bitrate || 5000 };
+              return { url: best.url, provider: `Rotten Tomatoes ${quality}`, bitrate: best.bitrate || 5000, height: best.height };
             }
           }
         } catch (e) { /* try next trailer */ }
@@ -338,7 +338,7 @@ async function resolveFandango(imdbId, meta) {
     const best = parseSMIL(smilXml);
     if (best) {
       const quality = best.height >= 1080 ? '1080p' : `${best.height}p`;
-      return { url: best.url, provider: `Fandango ${quality}`, bitrate: best.bitrate || 8000 };
+      return { url: best.url, provider: `Fandango ${quality}`, bitrate: best.bitrate || 8000, height: best.height };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -370,7 +370,7 @@ async function resolveIMDb(imdbId) {
 
     const urlMatch = videoHtml.match(/"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/);
     if (urlMatch) {
-      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0 };
+      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, height: 0 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -379,7 +379,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v16:${imdbId}`;
+  const cacheKey = `trailer:v17:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -406,11 +406,11 @@ async function resolveTrailers(imdbId, type, cache) {
     resolveFandango(imdbId, meta)
   ]);
 
-  // Collect all results, sort by bitrate (highest = best quality first)
+  // Collect all results, sort by resolution first, then bitrate (highest = best)
   const seen = new Set();
   const links = [fandangoResult, appleTvResult, rtResult, plexResult, imdbResult]
     .filter(r => r !== null)
-    .sort((a, b) => b.bitrate - a.bitrate)
+    .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)
     .filter(r => {
       if (seen.has(r.url)) return false;
       seen.add(r.url);
