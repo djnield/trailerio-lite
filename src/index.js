@@ -155,17 +155,38 @@ async function resolveAppleTV(imdbId, meta) {
     );
     const html = await pageRes.text();
 
-    // Find HLS playlist URLs with surrounding context for type detection
-    const hlsMatches = [...html.matchAll(/https:\/\/play[^"]*\.m3u8[^"]*/g)];
-    const withContext = hlsMatches.map(m => ({
-      url: m[0],
-      ctx: html.substring(Math.max(0, m.index - 500), m.index).toLowerCase()
-    })).filter(v => !v.url.includes('subscription'));
-    // Prefer full trailer, then any trailer, then anything
-    const pick = withContext.find(v => v.ctx.includes('trailer') && !/teaser|clip|behind|featurette/i.test(v.ctx))
-      || withContext.find(v => v.ctx.includes('trailer'))
-      || withContext[0];
-    const trailerUrl = pick?.url;
+    // Try structured JSON first (Preview items with titles mapped to playlist URLs)
+    let trailerUrl = null;
+    const jsonMatch = html.match(/<script[^>]*>(\{[\s\S]*?"Preview"[\s\S]*?\})<\/script>/);
+    if (jsonMatch) {
+      try {
+        const pageData = JSON.parse(jsonMatch[1]);
+        const junk = /teaser|clip|behind|featurette|sneak|opening/i;
+        const entries = [];
+        for (const d of pageData.data || []) {
+          for (const shelf of d?.data?.shelves || []) {
+            const items = shelf.items || [];
+            const playlist = shelf.playlistItems || [];
+            items.forEach((item, i) => {
+              if (item.type === 'Preview' && i < playlist.length) {
+                const url = playlist[i]?.playable?.assets?.hlsUrl;
+                if (url) entries.push({ title: item.title || '', url });
+              }
+            });
+          }
+        }
+        // Prefer: title has "trailer" and no junk > any non-junk > anything
+        const best = entries.find(e => /trailer/i.test(e.title) && !junk.test(e.title))
+          || entries.find(e => !junk.test(e.title))
+          || entries[0];
+        if (best) trailerUrl = best.url;
+      } catch (e) { /* JSON parse failed, fall through */ }
+    }
+    // Fallback: regex extract m3u8 URLs from HTML
+    if (!trailerUrl) {
+      const hlsMatches = html.match(/https:\/\/play[^"]*\.m3u8[^"]*/g) || [];
+      trailerUrl = hlsMatches[0];
+    }
 
     if (trailerUrl) {
       const cleanUrl = trailerUrl.replace(/&amp;/g, '&');
@@ -429,7 +450,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v22:${imdbId}`;
+  const cacheKey = `trailer:v23:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
