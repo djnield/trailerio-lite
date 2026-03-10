@@ -155,10 +155,17 @@ async function resolveAppleTV(imdbId, meta) {
     );
     const html = await pageRes.text();
 
-    // Find HLS playlist URL (prefer non-subscription trailers)
-    const hlsMatches = html.match(/https:\/\/play[^"]*\.m3u8[^"]*/g) || [];
-    // Filter out subscription URLs, prefer trailer URLs
-    const trailerUrl = hlsMatches.find(u => !u.includes('subscription')) || hlsMatches[0];
+    // Find HLS playlist URLs with surrounding context for type detection
+    const hlsMatches = [...html.matchAll(/https:\/\/play[^"]*\.m3u8[^"]*/g)];
+    const withContext = hlsMatches.map(m => ({
+      url: m[0],
+      ctx: html.substring(Math.max(0, m.index - 500), m.index).toLowerCase()
+    })).filter(v => !v.url.includes('subscription'));
+    // Prefer full trailer, then any trailer, then anything
+    const pick = withContext.find(v => v.ctx.includes('trailer') && !/teaser|clip|behind|featurette/i.test(v.ctx))
+      || withContext.find(v => v.ctx.includes('trailer'))
+      || withContext[0];
+    const trailerUrl = pick?.url || hlsMatches[0]?.[0];
 
     if (trailerUrl) {
       const cleanUrl = trailerUrl.replace(/&amp;/g, '&');
