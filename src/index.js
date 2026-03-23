@@ -537,7 +537,8 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
     if (pool.length > 0) {
       const dubbed = pool.find(e => dubbedRe && dubbedRe.test(e.title));
       const nonOrig = pool.find(e => !originalRe || !originalRe.test(e.title));
-      const best = dubbed || nonOrig || pool[0];
+      const best = dubbed || nonOrig || (originalRe ? null : pool[0]);
+      if (!best) return null;
       const tag = dubbed ? `${label} dubbed` : label;
       const result = await resolveDailymotion(best.id, tag);
       if (result) return { ...result, localized: true };
@@ -624,7 +625,7 @@ function resolveAdoroCinema(imdbId, meta) {
 // ============== DAILYMOTION CHANNEL SEARCH (title-based fallback) ==============
 
 // Allowed words after movie title in video names (trailer keywords, numbers, articles, connectors)
-const DM_TITLE_NEXT = /^(trailer|teaser|bande|annonce|fragman|tráiler|clip|hd|4k|1080p|official|ufficiale|officiel|primer|primo|final|nuevo|nouveau|nuovo|the|of|and|in|at|vs|a|an|el|le|la|il|lo|der|die|das|o|e|y|et|und)\b/;
+const DM_TITLE_NEXT = /^(trailer|teaser|bande|annonce|fragman|tráiler|clip|hd|4k|1080p|official|ufficiale|officiel|primer|primo|final|nuevo|nouveau|nuovo|saison|season|staffel|temporada|stagione)\b/;
 
 async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe) {
   try {
@@ -661,10 +662,11 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
       : (titleWords >= 3 ? matched : []);
     if (pool.length === 0) return null;
 
-    // Prefer dubbed version
+    // Prefer dubbed version; don't serve VO-only results as localized
     const dubbed = dubbedRe ? pool.find(v => dubbedRe.test(v.title)) : null;
     const nonOrig = originalRe ? pool.find(v => !originalRe.test(v.title)) : pool[0];
-    const best = dubbed || nonOrig || pool[0];
+    const best = dubbed || nonOrig || (originalRe ? null : pool[0]);
+    if (!best) return null;
 
     const tag = dubbed ? `${label} dubbed` : label;
     const result = await resolveDailymotion(best.id, tag);
