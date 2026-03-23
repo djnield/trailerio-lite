@@ -559,7 +559,7 @@ async function resolveFilmstarts(imdbId, meta) {
     if (!filmstartsId) return null;
 
     const pageRes = await fetchWithTimeout(
-      `https://www.filmstarts.de/kritiken/${filmstartsId}/`,
+      `https://www.filmstarts.de/kritiken/${filmstartsId}.html`,
       { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
     );
     if (!pageRes.ok) return null;
