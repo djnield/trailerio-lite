@@ -7,13 +7,15 @@ const LANG_CONFIG = {
   fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'] },
   de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'] },
   it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano' },
-  es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español' },
-  pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português' },
+  es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'] },
+  pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português', localSources: ['adorocinema'] },
   ru: { appleCountry: 'ru', mubiCountry: 'RU', label: 'Русский' },
   ja: { appleCountry: 'jp', mubiCountry: 'JP', label: '日本語' },
   ko: { appleCountry: 'kr', mubiCountry: 'KR', label: '한국어' },
-  cs: { appleCountry: 'cz', mubiCountry: 'CZ', label: 'Čeština', localSources: ['csfd'] },
+  cs: { appleCountry: 'cz', mubiCountry: 'CZ', label: 'Čeština' },
   hi: { appleCountry: 'in', mubiCountry: 'IN', label: 'हिन्दी' },
+  tr: { appleCountry: 'tr', mubiCountry: 'TR', label: 'Türkçe' },
+  ar: { appleCountry: 'sa', mubiCountry: 'SA', label: 'العربية' },
 };
 
 const LANG_CODES = Object.keys(LANG_CONFIG).filter(k => k !== 'en');
@@ -142,10 +144,10 @@ async function getWikidataIds(wikidataId) {
       rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value,
       fandangoId: entity.claims?.P5693?.[0]?.mainsnak?.datavalue?.value,
       mubiId: entity.claims?.P7299?.[0]?.mainsnak?.datavalue?.value,
-      // Localized sources
+      // Webedia network (AlloCiné ID also works on SensaCine + Beyazperde)
       allocineId: entity.claims?.P1265?.[0]?.mainsnak?.datavalue?.value,
       filmstartsId: entity.claims?.P8531?.[0]?.mainsnak?.datavalue?.value,
-      csfdId: entity.claims?.P2529?.[0]?.mainsnak?.datavalue?.value
+      adoroCinemaId: entity.claims?.P7777?.[0]?.mainsnak?.datavalue?.value
     };
   } catch (e) {
     return {};
@@ -509,155 +511,120 @@ async function resolveDailymotion(dmVideoId, providerLabel) {
   return null;
 }
 
-// ============== LOCALIZED SOURCE RESOLVERS ==============
+// ============== WEBEDIA NETWORK RESOLVERS ==============
+// AlloCiné, SensaCine, AdoroCinema, Filmstarts, Beyazperde all use Dailymotion
 
-// 7. AlloCiné - French dubbed (VF) trailers via Dailymotion
-async function resolveAllocine(imdbId, meta) {
+const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+
+async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
   try {
-    const allocineId = meta?.wikidataIds?.allocineId;
-    if (!allocineId) return null;
-
-    const ua = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
-    const pageRes = await fetchWithTimeout(
-      `https://www.allocine.fr/film/fichefilm_gen_cfilm=${allocineId}.html`,
-      { headers: ua }
-    );
-    if (!pageRes.ok) return null;
-    const html = await pageRes.text();
-
-    // Find cmedia IDs for this film's own videos (not ads)
-    const cmediaIds = [...new Set(
-      [...html.matchAll(new RegExp(`cmedia=(\\d+)[^"]*cfilm=${allocineId}`, 'g'))].map(m => m[1])
-    )];
-
-    if (cmediaIds.length > 0) {
-      // Fetch up to 3 video player pages in parallel to find VF trailer
-      const playerPages = await Promise.all(
-        cmediaIds.slice(0, 3).map(async (cmedia) => {
-          try {
-            const res = await fetchWithTimeout(
-              `https://www.allocine.fr/video/player_gen_cmedia=${cmedia}&cfilm=${allocineId}.html`,
-              { headers: ua }, 5000
-            );
-            if (!res.ok) return null;
-            let ph = await res.text();
-            ph = ph.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
-            const dm = ph.match(/idDailymotion[^a-zA-Z0-9]*([a-zA-Z0-9]{5,12})/);
-            const title = ph.match(/<title>([^<]+)/);
-            return dm ? { id: dm[1], title: title ? title[1] : '' } : null;
-          } catch { return null; }
-        })
-      );
-
-      const videos = playerPages.filter(Boolean);
-      if (videos.length > 0) {
-        // Prefer VF (French dubbed), avoid VO/VOSTFR
-        const vf = videos.find(v => /\bVF\b/i.test(v.title));
-        const nonVO = videos.find(v => !/\bVO\b|VOSTFR/i.test(v.title));
-        const best = vf || nonVO || videos[0];
-        const label = /\bVF\b/i.test(best.title) ? 'AlloCiné VF' : 'AlloCiné';
-        const result = await resolveDailymotion(best.id, label);
-        if (result) return { ...result, localized: true };
-      }
-    }
-  } catch (e) { /* silent fail */ }
-  return null;
-}
-
-// 8. Filmstarts.de - German dubbed trailers via Dailymotion
-async function resolveFilmstarts(imdbId, meta) {
-  try {
-    const filmstartsId = meta?.wikidataIds?.filmstartsId;
-    if (!filmstartsId) return null;
-
-    const ua = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
-    const pageRes = await fetchWithTimeout(
-      `https://www.filmstarts.de/kritiken/${filmstartsId}.html`,
-      { headers: ua }
-    );
+    const pageRes = await fetchWithTimeout(pageUrl, { headers: UA });
     if (!pageRes.ok) return null;
     let html = await pageRes.text();
     html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
 
-    // Find cmedia IDs for this film's own videos
-    const cmediaIds = [...new Set(
-      [...html.matchAll(new RegExp(`cmedia=(\\d+)[^"]*cfilm=${filmstartsId}`, 'g'))].map(m => m[1])
-    )];
+    // Strategy 1: Find DM IDs with titles directly on page (SensaCine, AdoroCinema)
+    const entries = [...html.matchAll(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*?"title"\s*:\s*"([^"]+)"/g)]
+      .map(m => ({ id: m[1], title: m[2] }));
+    const entriesRev = [...html.matchAll(/"title"\s*:\s*"([^"]+)"[^}]*?"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/g)]
+      .map(m => ({ id: m[2], title: m[1] }));
+    const all = [...entries, ...entriesRev];
 
-    if (cmediaIds.length > 0) {
-      // Fetch up to 3 video player pages in parallel
-      const playerPages = await Promise.all(
-        cmediaIds.slice(0, 3).map(async (cmedia) => {
-          try {
-            const res = await fetchWithTimeout(
-              `https://www.filmstarts.de/video/player_gen_cmedia=${cmedia}&cfilm=${filmstartsId}.html`,
-              { headers: ua }, 5000
-            );
-            if (!res.ok) return null;
-            let ph = await res.text();
-            ph = ph.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-            const dm = ph.match(/idDailymotion[^a-zA-Z0-9]*([a-zA-Z0-9]{5,12})/);
-            const title = ph.match(/<title>([^<]+)/);
-            return dm ? { id: dm[1], title: title ? title[1] : '' } : null;
-          } catch { return null; }
-        })
-      );
+    // Filter to trailer-related entries only
+    const trailers = all.filter(e => /trailer|bande|teaser|tráiler|fragman/i.test(e.title));
+    const pool = trailers.length > 0 ? trailers : all;
 
-      const videos = playerPages.filter(Boolean);
-      if (videos.length > 0) {
-        // Prefer DF (Deutsche Fassung) or dubbed, avoid OV/OmU
-        const dubbed = videos.find(v => /\bDF\b|deutsch/i.test(v.title));
-        const nonOV = videos.find(v => !/\bOV\b|\bOmU\b|\bOmdU\b/i.test(v.title));
-        const best = dubbed || nonOV || videos[0];
-        const result = await resolveDailymotion(best.id, 'Filmstarts');
-        if (result) return { ...result, localized: true };
-      }
+    if (pool.length > 0) {
+      const dubbed = pool.find(e => dubbedRe && dubbedRe.test(e.title));
+      const nonOrig = pool.find(e => !originalRe || !originalRe.test(e.title));
+      const best = dubbed || nonOrig || pool[0];
+      const tag = dubbed ? `${label} dubbed` : label;
+      const result = await resolveDailymotion(best.id, tag);
+      if (result) return { ...result, localized: true };
     }
 
-    // Fallback: direct DM ID from main page (older approach)
-    const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/);
-    if (dmMatch) {
-      const result = await resolveDailymotion(dmMatch[1], 'Filmstarts');
-      if (result) return { ...result, localized: true };
+    // Strategy 2: Find cmedia IDs for this film, fetch player pages (AlloCiné, Filmstarts)
+    if (filmId) {
+      const cmediaIds = [...new Set(
+        [...html.matchAll(new RegExp(`cmedia=(\\d+)[^"]*cfilm=${filmId}`, 'g'))].map(m => m[1])
+      )];
+      if (cmediaIds.length > 0) {
+        const baseUrl = new URL(pageUrl).origin;
+        const playerPages = await Promise.all(
+          cmediaIds.slice(0, 3).map(async (cmedia) => {
+            try {
+              const res = await fetchWithTimeout(
+                `${baseUrl}/video/player_gen_cmedia=${cmedia}&cfilm=${filmId}.html`,
+                { headers: UA }, 5000
+              );
+              if (!res.ok) return null;
+              let ph = await res.text();
+              ph = ph.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+              const dm = ph.match(/idDailymotion[^a-zA-Z0-9]*([a-zA-Z0-9]{5,12})/);
+              const title = ph.match(/<title>([^<]+)/);
+              return dm ? { id: dm[1], title: title ? title[1] : '' } : null;
+            } catch { return null; }
+          })
+        );
+        const videos = playerPages.filter(Boolean);
+        if (videos.length > 0) {
+          const dubbed = videos.find(v => dubbedRe && dubbedRe.test(v.title));
+          const nonOrig = videos.find(v => !originalRe || !originalRe.test(v.title));
+          const best = dubbed || nonOrig || videos[0];
+          const tag = dubbed ? `${label} dubbed` : label;
+          const result = await resolveDailymotion(best.id, tag);
+          if (result) return { ...result, localized: true };
+        }
+      }
     }
   } catch (e) { /* silent fail */ }
   return null;
 }
 
-// 9. CSFD.cz - Czech/Slovak trailers
-async function resolveCSFD(imdbId, meta) {
-  try {
-    const csfdId = meta?.wikidataIds?.csfdId;
-    if (!csfdId) return null;
+// 7. AlloCiné (French)
+function resolveAllocine(imdbId, meta) {
+  const id = meta?.wikidataIds?.allocineId;
+  if (!id) return Promise.resolve(null);
+  return resolveWebedia(
+    `https://www.allocine.fr/film/fichefilm_gen_cfilm=${id}.html`,
+    id, 'AlloCiné', /\bVF\b/i, /\bVO\b|VOSTFR/i
+  );
+}
 
-    const pageRes = await fetchWithTimeout(
-      `https://www.csfd.cz/film/${csfdId}/videa/`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
-    );
-    if (!pageRes.ok) return null;
-    const html = await pageRes.text();
+// 8. Filmstarts (German)
+function resolveFilmstarts(imdbId, meta) {
+  const id = meta?.wikidataIds?.filmstartsId;
+  if (!id) return Promise.resolve(null);
+  return resolveWebedia(
+    `https://www.filmstarts.de/kritiken/${id}.html`,
+    id, 'Filmstarts', /\bDF\b|deutsch/i, /\bOV\b|\bOmU\b|\bOmdU\b/i
+  );
+}
 
-    // Check for Dailymotion embed first
-    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
-                 || html.match(/data-video="([a-zA-Z0-9]+)"/);
-    if (dmMatch) {
-      const result = await resolveDailymotion(dmMatch[1], 'CSFD');
-      if (result) return { ...result, localized: true };
-    }
+// 9. SensaCine (Spanish) - uses same AlloCiné ID (P1265)
+function resolveSensaCine(imdbId, meta) {
+  const id = meta?.wikidataIds?.allocineId;
+  if (!id) return Promise.resolve(null);
+  return resolveWebedia(
+    `https://www.sensacine.com/peliculas/pelicula-${id}/`,
+    id, 'SensaCine', /doblad|tráiler/i, /\bVO\b|VOSE|subtitulad/i
+  );
+}
 
-    // Fallback: direct MP4 link
-    const mp4Match = html.match(/(https?:\/\/[^"'\s]+\.mp4)/);
-    if (mp4Match) {
-      return { url: mp4Match[1], provider: 'CSFD', bitrate: 0, width: 0, height: 0, localized: true };
-    }
-  } catch (e) { /* silent fail */ }
-  return null;
+// 10. AdoroCinema (Brazilian Portuguese) - P7777
+function resolveAdoroCinema(imdbId, meta) {
+  const id = meta?.wikidataIds?.adoroCinemaId;
+  if (!id) return Promise.resolve(null);
+  return resolveWebedia(
+    `https://www.adorocinema.com/filmes/filme-${id}/`,
+    id, 'AdoroCinema', /dublad/i, /original|legendad/i
+  );
 }
 
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v30:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v31:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -685,11 +652,12 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
     resolveFandango(imdbId, meta),
   ];
 
-  // Add language-specific local sources
+  // Add language-specific local sources (Webedia network)
   const localSources = LANG_CONFIG[lang]?.localSources || [];
   if (localSources.includes('allocine')) phase3.push(resolveAllocine(imdbId, meta));
   if (localSources.includes('filmstarts')) phase3.push(resolveFilmstarts(imdbId, meta));
-  if (localSources.includes('csfd')) phase3.push(resolveCSFD(imdbId, meta));
+  if (localSources.includes('sensacine')) phase3.push(resolveSensaCine(imdbId, meta));
+  if (localSources.includes('adorocinema')) phase3.push(resolveAdoroCinema(imdbId, meta));
 
   const phase3Results = await Promise.all(phase3);
 
