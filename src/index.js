@@ -3,18 +3,18 @@
 
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
-  en: { appleCountry: 'us', mubiCountry: 'US', label: 'English', dmChannel: 'x1xbudh' },
-  fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dmChannel: 'allocine', dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|VOSTFR/i },
-  de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'], dmChannel: 'FILMSTARTS', dubbedRe: /\bDF\b|deutsch/i, originalRe: /\bOV\b|\bOmU\b/i },
-  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano', dmChannel: 'mymoviesit' },
-  es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'], dmChannel: 'sensacine' },
-  pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português', localSources: ['adorocinema'], dmChannel: 'adorocinema', dubbedRe: /dublad/i, originalRe: /original|legendad/i },
+  en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
+  fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|VOSTFR/i },
+  de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'], dubbedRe: /\bDF\b|deutsch/i, originalRe: /\bOV\b|\bOmU\b/i },
+  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano' },
+  es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'] },
+  pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português', localSources: ['adorocinema'], dubbedRe: /dublad/i, originalRe: /original|legendad/i },
   ru: { appleCountry: 'ru', mubiCountry: 'RU', label: 'Русский' },
   ja: { appleCountry: 'jp', mubiCountry: 'JP', label: '日本語' },
   ko: { appleCountry: 'kr', mubiCountry: 'KR', label: '한국어' },
   cs: { appleCountry: 'cz', mubiCountry: 'CZ', label: 'Čeština' },
   hi: { appleCountry: 'in', mubiCountry: 'IN', label: 'हिन्दी' },
-  tr: { appleCountry: 'tr', mubiCountry: 'TR', label: 'Türkçe', dmChannel: 'beyazperde' },
+  tr: { appleCountry: 'tr', mubiCountry: 'TR', label: 'Türkçe' },
   ar: { appleCountry: 'ae', mubiCountry: 'AE', label: 'العربية' },
 };
 
@@ -515,13 +515,20 @@ async function resolveDailymotion(dmVideoId, providerLabel) {
 // AlloCiné, SensaCine, AdoroCinema, Filmstarts, Beyazperde all use Dailymotion
 
 const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+const decodeEntities = s => s.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+
+function pickBestVersion(pool, dubbedRe, originalRe) {
+  const dubbed = pool.find(e => dubbedRe && dubbedRe.test(e.title));
+  const nonOrig = pool.find(e => !originalRe || !originalRe.test(e.title));
+  const best = dubbed || nonOrig || (originalRe ? null : pool[0]);
+  return { best, dubbed: !!dubbed };
+}
 
 async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
   try {
     const pageRes = await fetchWithTimeout(pageUrl, { headers: UA });
     if (!pageRes.ok) return null;
-    let html = await pageRes.text();
-    html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+    let html = decodeEntities(await pageRes.text());
 
     // Strategy 1: Find DM IDs with titles directly on page (SensaCine, AdoroCinema)
     const entries = [...html.matchAll(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*?"title"\s*:\s*"([^"]+)"/g)]
@@ -535,12 +542,9 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
     const pool = trailers.length > 0 ? trailers : all;
 
     if (pool.length > 0) {
-      const dubbed = pool.find(e => dubbedRe && dubbedRe.test(e.title));
-      const nonOrig = pool.find(e => !originalRe || !originalRe.test(e.title));
-      const best = dubbed || nonOrig || (originalRe ? null : pool[0]);
+      const { best, dubbed } = pickBestVersion(pool, dubbedRe, originalRe);
       if (!best) return null;
-      const tag = dubbed ? `${label} dubbed` : label;
-      const result = await resolveDailymotion(best.id, tag);
+      const result = await resolveDailymotion(best.id, dubbed ? `${label} dubbed` : label);
       if (result) return { ...result, localized: true };
     }
 
@@ -559,8 +563,7 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
                 { headers: UA }, 5000
               );
               if (!res.ok) return null;
-              let ph = await res.text();
-              ph = ph.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+              let ph = decodeEntities(await res.text());
               const dm = ph.match(/idDailymotion[^a-zA-Z0-9]*([a-zA-Z0-9]{5,12})/);
               const title = ph.match(/<title>([^<]+)/);
               return dm ? { id: dm[1], title: title ? title[1] : '' } : null;
@@ -569,11 +572,9 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
         );
         const videos = playerPages.filter(Boolean);
         if (videos.length > 0) {
-          const dubbed = videos.find(v => dubbedRe && dubbedRe.test(v.title));
-          const nonOrig = videos.find(v => !originalRe || !originalRe.test(v.title));
-          const best = dubbed || nonOrig || videos[0];
-          const tag = dubbed ? `${label} dubbed` : label;
-          const result = await resolveDailymotion(best.id, tag);
+          const { best, dubbed } = pickBestVersion(videos, dubbedRe, originalRe);
+          if (!best) return null;
+          const result = await resolveDailymotion(best.id, dubbed ? `${label} dubbed` : label);
           if (result) return { ...result, localized: true };
         }
       }
@@ -583,7 +584,7 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
 }
 
 // 7. AlloCiné (French)
-function resolveAllocine(imdbId, meta) {
+function resolveAllocine(meta) {
   const id = meta?.wikidataIds?.allocineId;
   if (!id) return Promise.resolve(null);
   return resolveWebedia(
@@ -593,7 +594,7 @@ function resolveAllocine(imdbId, meta) {
 }
 
 // 8. Filmstarts (German)
-function resolveFilmstarts(imdbId, meta) {
+function resolveFilmstarts(meta) {
   const id = meta?.wikidataIds?.filmstartsId;
   if (!id) return Promise.resolve(null);
   return resolveWebedia(
@@ -603,7 +604,7 @@ function resolveFilmstarts(imdbId, meta) {
 }
 
 // 9. SensaCine (Spanish) - uses same AlloCiné ID (P1265)
-function resolveSensaCine(imdbId, meta) {
+function resolveSensaCine(meta) {
   const id = meta?.wikidataIds?.allocineId;
   if (!id) return Promise.resolve(null);
   return resolveWebedia(
@@ -613,7 +614,7 @@ function resolveSensaCine(imdbId, meta) {
 }
 
 // 10. AdoroCinema (Brazilian Portuguese) - P7777
-function resolveAdoroCinema(imdbId, meta) {
+function resolveAdoroCinema(meta) {
   const id = meta?.wikidataIds?.adoroCinemaId;
   if (!id) return Promise.resolve(null);
   return resolveWebedia(
@@ -622,55 +623,10 @@ function resolveAdoroCinema(imdbId, meta) {
   );
 }
 
-// ============== DAILYMOTION CHANNEL SEARCH (LLM-powered title matching) ==============
-
-async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe, env) {
-  try {
-    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,description,language,duration&limit=10&sort=relevance`;
-    const res = await fetchWithTimeout(searchUrl, {}, 5000);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const videos = data.list || [];
-    if (videos.length === 0) return null;
-
-    // Pre-filter: duration gate (trailers are 30s-5min)
-    const candidates = videos.filter(v => !v.duration || (v.duration >= 30 && v.duration <= 300));
-    if (candidates.length === 0) return null;
-
-    // LLM title matching — replaces all regex heuristics
-    const videoList = candidates.map((v, i) => {
-      const desc = v.description ? ` - ${v.description.replace(/<[^>]*>/g, '').slice(0, 100)}` : '';
-      return `${i + 1}. "${v.title}" (${v.duration}s)${desc}`;
-    }).join('\n');
-    const aiResult = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-      messages: [{ role: 'user', content:
-        `Which of these are official trailers (trailer/bande-annonce) for "${searchTitle}"? NOT teasers, clips, interviews, or different titles. Reply with ONLY the matching numbers comma-separated, or "none".\n\n${videoList}` }],
-      max_tokens: 32
-    });
-
-    const response = aiResult?.response || '';
-    if (response.toLowerCase().includes('none')) return null;
-    const indices = response.match(/\d+/g)?.map(n => parseInt(n) - 1) || [];
-    const pool = indices.filter(i => i >= 0 && i < candidates.length).map(i => candidates[i]);
-    if (pool.length === 0) return null;
-
-    // Prefer dubbed version; don't serve VO-only results as localized
-    const dubbed = dubbedRe ? pool.find(v => dubbedRe.test(v.title)) : null;
-    const nonOrig = originalRe ? pool.find(v => !originalRe.test(v.title)) : pool[0];
-    const best = dubbed || nonOrig || (originalRe ? null : pool[0]);
-    if (!best) return null;
-
-    const tag = dubbed ? `${label} dubbed` : label;
-    const result = await resolveDailymotion(best.id, tag);
-    if (result) return { ...result, localized: true };
-  } catch (e) { /* silent fail — LLM or API failure just skips DM source */ }
-  return null;
-}
-
 // ============== MAIN RESOLVER ==============
 
-async function resolveTrailers(imdbId, type, cache, lang = 'en', env = null) {
-  const cacheKey = `trailer:v38:${lang}:${imdbId}`;
+async function resolveTrailers(imdbId, type, cache, lang = 'en') {
+  const cacheKey = `trailer:v39:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -700,16 +656,10 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', env = null) {
 
   // Add language-specific local sources (Webedia network)
   const localSources = LANG_CONFIG[lang]?.localSources || [];
-  if (localSources.includes('allocine')) phase3.push(resolveAllocine(imdbId, meta));
-  if (localSources.includes('filmstarts')) phase3.push(resolveFilmstarts(imdbId, meta));
-  if (localSources.includes('sensacine')) phase3.push(resolveSensaCine(imdbId, meta));
-  if (localSources.includes('adorocinema')) phase3.push(resolveAdoroCinema(imdbId, meta));
-
-  // DM channel search fallback (title-based, works when Wikidata IDs are missing)
-  const dmConfig = LANG_CONFIG[lang];
-  if (dmConfig?.dmChannel && meta?.title) {
-    phase3.push(resolveDMChannel(dmConfig.dmChannel, meta.title, dmConfig.label, dmConfig.dubbedRe, dmConfig.originalRe, env));
-  }
+  if (localSources.includes('allocine')) phase3.push(resolveAllocine(meta));
+  if (localSources.includes('filmstarts')) phase3.push(resolveFilmstarts(meta));
+  if (localSources.includes('sensacine')) phase3.push(resolveSensaCine(meta));
+  if (localSources.includes('adorocinema')) phase3.push(resolveAdoroCinema(meta));
 
   const phase3Results = await Promise.all(phase3);
 
@@ -803,7 +753,7 @@ export default {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const result = await resolveTrailers(imdbId, type, cache, lang, env);
+      const result = await resolveTrailers(imdbId, type, cache, lang);
 
       return new Response(JSON.stringify({
         meta: {
