@@ -622,14 +622,10 @@ function resolveAdoroCinema(imdbId, meta) {
   );
 }
 
-// ============== DAILYMOTION CHANNEL SEARCH (title-based fallback) ==============
+// ============== DAILYMOTION CHANNEL SEARCH (LLM-powered title matching) ==============
 
-// Allowed words after movie title in video names (trailer keywords, numbers, articles, connectors)
-const DM_TITLE_NEXT = /^(trailer|teaser|bande|annonce|fragman|tráiler|clip|hd|4k|1080p|official|ufficiale|officiel|primer|primo|final|nuevo|nouveau|nuovo|saison|season|staffel|temporada|stagione)\b/;
-
-async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe) {
+async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe, env) {
   try {
-    // Request duration field for trailer-length validation (expert strategy)
     const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language,duration&limit=10&sort=relevance`;
     const res = await fetchWithTimeout(searchUrl, {}, 5000);
     if (!res.ok) return null;
@@ -637,29 +633,22 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
     const videos = data.list || [];
     if (videos.length === 0) return null;
 
-    // Strict title matching: video must start with movie title,
-    // next word must be a trailer keyword or subtitle connector, NOT a different movie's name
-    const normalize = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
-    const movieTitle = normalize(searchTitle);
-    const titleWords = movieTitle.split(' ').length;
-    const matched = videos.filter(v => {
-      // Duration gate: trailers are 30s-5min, reject clips/compilations
-      if (v.duration && (v.duration < 30 || v.duration > 300)) return false;
-      const vt = normalize(v.title);
-      if (!vt.startsWith(movieTitle)) return false;
-      const rest = vt.slice(movieTitle.length).trim();
-      return rest === '' || DM_TITLE_NEXT.test(rest);
-    });
-    if (matched.length === 0) return null;
+    // Pre-filter: duration gate (trailers are 30s-5min)
+    const candidates = videos.filter(v => !v.duration || (v.duration >= 30 && v.duration <= 300));
+    if (candidates.length === 0) return null;
 
-    // Filter to trailer-like entries, exclude junk
-    const trailerRe = /trailer|bande|teaser|tráiler|fragman/i;
-    const junkRe = /clip|behind|featurette|interview|review|crítica|react|reaction|explained|recap|parody/i;
-    const trailers = matched.filter(v => trailerRe.test(v.title) && !junkRe.test(v.title));
-    // Short titles (1-2 words like "It", "Us", "Up", "Cars") MUST have trailer keyword
-    // This prevents matching "Cars 2" when searching for "Cars", etc.
-    const pool = (trailers.length > 0) ? trailers
-      : (titleWords >= 3 ? matched : []);
+    // LLM title matching — replaces all regex heuristics
+    const videoList = candidates.map((v, i) => `${i + 1}. "${v.title}" (${v.duration}s)`).join('\n');
+    const aiResult = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+      messages: [{ role: 'user', content:
+        `Which of these videos are trailers or teasers for "${searchTitle}"? Not for sequels, spinoffs, or different titles. Reply with ONLY the matching numbers comma-separated, or "none".\n\n${videoList}` }],
+      max_tokens: 32
+    });
+
+    const response = aiResult?.response || '';
+    if (response.toLowerCase().includes('none')) return null;
+    const indices = response.match(/\d+/g)?.map(n => parseInt(n) - 1) || [];
+    const pool = indices.filter(i => i >= 0 && i < candidates.length).map(i => candidates[i]);
     if (pool.length === 0) return null;
 
     // Prefer dubbed version; don't serve VO-only results as localized
@@ -671,14 +660,14 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
     const tag = dubbed ? `${label} dubbed` : label;
     const result = await resolveDailymotion(best.id, tag);
     if (result) return { ...result, localized: true };
-  } catch (e) { /* silent fail */ }
+  } catch (e) { /* silent fail — LLM or API failure just skips DM source */ }
   return null;
 }
 
 // ============== MAIN RESOLVER ==============
 
-async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v36:${lang}:${imdbId}`;
+async function resolveTrailers(imdbId, type, cache, lang = 'en', env = null) {
+  const cacheKey = `trailer:v37:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -716,7 +705,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
   // DM channel search fallback (title-based, works when Wikidata IDs are missing)
   const dmConfig = LANG_CONFIG[lang];
   if (dmConfig?.dmChannel && meta?.title) {
-    phase3.push(resolveDMChannel(dmConfig.dmChannel, meta.title, dmConfig.label, dmConfig.dubbedRe, dmConfig.originalRe));
+    phase3.push(resolveDMChannel(dmConfig.dmChannel, meta.title, dmConfig.label, dmConfig.dubbedRe, dmConfig.originalRe, env));
   }
 
   const phase3Results = await Promise.all(phase3);
@@ -811,7 +800,7 @@ export default {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const result = await resolveTrailers(imdbId, type, cache, lang);
+      const result = await resolveTrailers(imdbId, type, cache, lang, env);
 
       return new Response(JSON.stringify({
         meta: {
