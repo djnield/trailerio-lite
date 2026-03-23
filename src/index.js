@@ -480,10 +480,11 @@ async function resolveDailymotion(dmVideoId, providerLabel) {
     const qualities = data.qualities;
     if (!qualities) return null;
 
+    // Try resolution-specific MP4 first
     for (const res of ['1080', '720', '480', '380', '240']) {
       const streams = qualities[res];
       if (!streams) continue;
-      const mp4 = streams.find(s => s.type === 'video/mp4') || streams[0];
+      const mp4 = streams.find(s => s.type === 'video/mp4');
       if (mp4?.url) {
         const height = parseInt(res);
         return {
@@ -493,6 +494,15 @@ async function resolveDailymotion(dmVideoId, providerLabel) {
           width: Math.round(height * 16 / 9),
           height
         };
+      }
+    }
+
+    // Fallback: HLS stream (Dailymotion often only provides m3u8 now)
+    const autoStreams = qualities['auto'];
+    if (autoStreams) {
+      const hls = autoStreams.find(s => s.type === 'application/x-mpegURL');
+      if (hls?.url) {
+        return { url: hls.url, provider: `${providerLabel}`, bitrate: 0, width: 0, height: 0 };
       }
     }
   } catch (e) { /* silent fail */ }
@@ -512,10 +522,20 @@ async function resolveAllocine(imdbId, meta) {
       { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
     );
     if (!pageRes.ok) return null;
-    const html = await pageRes.text();
+    let html = await pageRes.text();
 
-    // AlloCiné embeds Dailymotion videos
-    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
+    // Decode HTML entities for embedded JSON (AlloCiné uses &quot; encoding)
+    html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+
+    // AlloCiné embeds Dailymotion video IDs in JSON as "idDailymotion":"xxx"
+    // Filter for trailer entries: look for file_type TRAILER with idDailymotion
+    const trailerDm = html.match(/"file_type"\s*:\s*"TRAILER"[^}]*"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
+                   || html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*"file_type"\s*:\s*"TRAILER"/);
+    if (trailerDm) return await resolveDailymotion(trailerDm[1], 'AlloCiné');
+
+    // Fallback: any Dailymotion ID on the page
+    const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
+                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
                  || html.match(/data-video="([a-zA-Z0-9]+)"/);
     if (!dmMatch) return null;
 
@@ -535,9 +555,19 @@ async function resolveFilmstarts(imdbId, meta) {
       { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
     );
     if (!pageRes.ok) return null;
-    const html = await pageRes.text();
+    let html = await pageRes.text();
 
-    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
+    // Decode HTML entities (same pattern as AlloCiné - same parent company)
+    html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+
+    // Look for trailer Dailymotion IDs
+    const trailerDm = html.match(/"file_type"\s*:\s*"TRAILER"[^}]*"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
+                   || html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*"file_type"\s*:\s*"TRAILER"/);
+    if (trailerDm) return await resolveDailymotion(trailerDm[1], 'Filmstarts');
+
+    // Fallback: any Dailymotion ID
+    const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
+                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
                  || html.match(/data-video="([a-zA-Z0-9]+)"/);
     if (!dmMatch) return null;
 
