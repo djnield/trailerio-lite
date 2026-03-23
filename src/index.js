@@ -3,7 +3,7 @@
 
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
-  en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
+  en: { appleCountry: 'us', mubiCountry: 'US', label: 'English', dmChannel: 'x1xbudh' },
   fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dmChannel: 'allocine', dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|VOSTFR/i },
   de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'], dmChannel: 'FILMSTARTS', dubbedRe: /\bDF\b|deutsch/i, originalRe: /\bOV\b|\bOmU\b/i },
   it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano', dmChannel: 'mymoviesit' },
@@ -625,18 +625,24 @@ function resolveAdoroCinema(imdbId, meta) {
 
 async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe) {
   try {
-    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language&limit=5&sort=relevance`;
+    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language&limit=10&sort=relevance`;
     const res = await fetchWithTimeout(searchUrl, {}, 5000);
     if (!res.ok) return null;
     const data = await res.json();
     const videos = data.list || [];
     if (videos.length === 0) return null;
 
+    // Strict title matching: normalize and verify the movie title appears in video title
+    const normalize = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+    const movieTitle = normalize(searchTitle);
+    const matched = videos.filter(v => normalize(v.title).includes(movieTitle));
+    if (matched.length === 0) return null;
+
     // Filter to trailer-like entries
     const trailerRe = /trailer|bande|teaser|tráiler|fragman/i;
     const junkRe = /clip|behind|featurette|interview|review|crítica/i;
-    const trailers = videos.filter(v => trailerRe.test(v.title) && !junkRe.test(v.title));
-    const pool = trailers.length > 0 ? trailers : videos;
+    const trailers = matched.filter(v => trailerRe.test(v.title) && !junkRe.test(v.title));
+    const pool = trailers.length > 0 ? trailers : matched;
 
     // Prefer dubbed version
     const dubbed = dubbedRe ? pool.find(v => dubbedRe.test(v.title)) : null;
@@ -653,7 +659,7 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v32:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v33:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
