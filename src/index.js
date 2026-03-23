@@ -42,7 +42,7 @@ const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
 
 // ============== UTILITIES ==============
 
-async function fetchWithTimeout(url, options = {}, timeout = 5000) {
+async function fetchWithTimeout(url, options = {}, timeout = 6000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
   try {
@@ -218,7 +218,20 @@ async function resolveAppleTV(imdbId, meta, lang = 'en') {
         const width = streamMatches[0][2] ? parseInt(streamMatches[0][2]) : 0;
         const height = streamMatches[0][3] ? parseInt(streamMatches[0][3]) : 0;
         const bitrate = Math.round(maxBandwidth / 1000);
-        const quality = width >= 3840 ? '4K' : width >= 1900 ? '1080p' : width >= 1200 ? '720p' : '1080p';
+
+        // Detect DV/HDR from VIDEO-RANGE and CODECS across all streams
+        const hasDV = /dvh1/i.test(m3u8Text) || /VIDEO-RANGE=PQ/i.test(m3u8Text);
+        const hasHDR = hasDV || /VIDEO-RANGE=HLG/i.test(m3u8Text) || /hev1\.\d+\.\d+\.L\d+/i.test(m3u8Text);
+        // Detect Atmos/Surround from audio groups
+        const hasAtmos = /atmos|ec-3/i.test(m3u8Text);
+        const hasSurround = hasAtmos || /CHANNELS="6"|CHANNELS="8"|ac-3/i.test(m3u8Text);
+
+        let quality = width >= 3840 ? '4K' : width >= 1900 ? '1080p' : width >= 1200 ? '720p' : '1080p';
+        if (hasDV) quality += ' DV';
+        else if (hasHDR) quality += ' HDR';
+        if (hasAtmos) quality += ' Atmos';
+        else if (hasSurround) quality += ' 5.1';
+
         return { url: candidate.url, provider: `Apple TV ${quality}`, bitrate, width, height, localized: lang !== 'en' };
       } catch (e) { continue; }
     }
@@ -633,7 +646,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v40:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v41:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -646,14 +659,21 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
   // ---------- METADATA PIPELINE (runs as one task) ----------
   // TMDB find → external_ids → Wikidata: chained but non-blocking to sources
   const metaPipeline = (async () => {
-    const tmdbMeta = await getTMDBMetadata(imdbId, type);
-    tmdbReady.resolve(tmdbMeta);  // unblocks Plex immediately
+    try {
+      const tmdbMeta = await getTMDBMetadata(imdbId, type);
+      tmdbReady.resolve(tmdbMeta);  // unblocks Plex immediately
 
-    const wikidataIds = tmdbMeta?.wikidataId
-      ? await getWikidataIds(tmdbMeta.wikidataId)
-      : {};
-    metaReady.resolve({ tmdbMeta, wikidataIds });  // unblocks all Phase 3 sources
-    return { tmdbMeta, wikidataIds };
+      const wikidataIds = tmdbMeta?.wikidataId
+        ? await getWikidataIds(tmdbMeta.wikidataId)
+        : {};
+      metaReady.resolve({ tmdbMeta, wikidataIds });  // unblocks all Phase 3 sources
+      return { tmdbMeta, wikidataIds };
+    } catch (e) {
+      // Always resolve to unblock downstream sources (they'll gracefully get null/empty)
+      tmdbReady.resolve(null);
+      metaReady.resolve({ tmdbMeta: null, wikidataIds: {} });
+      return { tmdbMeta: null, wikidataIds: {} };
+    }
   })();
 
   // ---------- ALL SOURCES IN PARALLEL (no phases, no waterfall) ----------
@@ -705,8 +725,12 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
     return resolveAdoroCinema({ ...tmdbMeta, wikidataIds });
   })());
 
-  // Wait for everything (metadata pipeline + all sources) concurrently
-  const [metaResult, ...allResults] = await Promise.all([metaPipeline, ...sources]);
+  // Wait for everything - allSettled so one source crash doesn't kill others
+  const settled = await Promise.allSettled([metaPipeline, ...sources]);
+  const metaResult = settled[0].status === 'fulfilled' ? settled[0].value : { tmdbMeta: null, wikidataIds: {} };
+  const allResults = settled.slice(1)
+    .filter(r => r.status === 'fulfilled')
+    .map(r => r.value);
 
   // Quality tier from largest dimension (aspect-ratio agnostic)
   const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
