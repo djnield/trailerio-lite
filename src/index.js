@@ -217,12 +217,12 @@ async function resolveAppleTV(imdbId, meta, lang = 'en') {
         const height = streamMatches[0][3] ? parseInt(streamMatches[0][3]) : 0;
         const bitrate = Math.round(maxBandwidth / 1000);
         const quality = width >= 3840 ? '4K' : width >= 1900 ? '1080p' : width >= 1200 ? '720p' : '1080p';
-        return { url: candidate.url, provider: `Apple TV ${quality}`, bitrate, width, height };
+        return { url: candidate.url, provider: `Apple TV ${quality}`, bitrate, width, height, localized: lang !== 'en' };
       } catch (e) { continue; }
     }
     // Last resort: return first URL without quality info
     if (candidates.length > 0) {
-      return { url: candidates[0].url, provider: 'Apple TV', bitrate: 0, width: 0, height: 0 };
+      return { url: candidates[0].url, provider: 'Apple TV', bitrate: 0, width: 0, height: 0, localized: lang !== 'en' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -426,7 +426,7 @@ async function resolveMUBI(imdbId, meta, lang = 'en') {
     const height = profileOrder[best.profile] || 0;
     const width = Math.round(height * 16 / 9);
 
-    return { url: best.url, provider: `MUBI ${best.profile}`, bitrate: 0, width, height };
+    return { url: best.url, provider: `MUBI ${best.profile}`, bitrate: 0, width, height, localized: lang !== 'en' };
   } catch (e) { /* silent fail */ }
   return null;
 }
@@ -517,37 +517,49 @@ async function resolveAllocine(imdbId, meta) {
     const allocineId = meta?.wikidataIds?.allocineId;
     if (!allocineId) return null;
 
+    const ua = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
     const pageRes = await fetchWithTimeout(
       `https://www.allocine.fr/film/fichefilm_gen_cfilm=${allocineId}.html`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
+      { headers: ua }
     );
     if (!pageRes.ok) return null;
-    let html = await pageRes.text();
+    const html = await pageRes.text();
 
-    // Decode HTML entities for embedded JSON (AlloCiné uses &quot; encoding)
-    html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+    // Find cmedia IDs for this film's own videos (not ads)
+    const cmediaIds = [...new Set(
+      [...html.matchAll(new RegExp(`cmedia=(\\d+)[^"]*cfilm=${allocineId}`, 'g'))].map(m => m[1])
+    )];
 
-    // Find all video entries with Dailymotion IDs and titles
-    // AlloCiné titles contain VF (Version Française = dubbed) or VO (Version Originale = original)
-    const entries = [...html.matchAll(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*?"title"\s*:\s*"([^"]+)"/g)];
-    const entriesRev = [...html.matchAll(/"title"\s*:\s*"([^"]+)"[^}]*?"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/g)]
-      .map(m => ({ id: m[2], title: m[1] }));
-    const all = [...entries.map(m => ({ id: m[1], title: m[2] })), ...entriesRev];
+    if (cmediaIds.length > 0) {
+      // Fetch up to 3 video player pages in parallel to find VF trailer
+      const playerPages = await Promise.all(
+        cmediaIds.slice(0, 3).map(async (cmedia) => {
+          try {
+            const res = await fetchWithTimeout(
+              `https://www.allocine.fr/video/player_gen_cmedia=${cmedia}&cfilm=${allocineId}.html`,
+              { headers: ua }, 5000
+            );
+            if (!res.ok) return null;
+            let ph = await res.text();
+            ph = ph.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+            const dm = ph.match(/idDailymotion[^a-zA-Z0-9]*([a-zA-Z0-9]{5,12})/);
+            const title = ph.match(/<title>([^<]+)/);
+            return dm ? { id: dm[1], title: title ? title[1] : '' } : null;
+          } catch { return null; }
+        })
+      );
 
-    if (all.length > 0) {
-      // Prefer VF (French dubbed), avoid VO/VOSTFR (original language)
-      const vf = all.find(e => /\bVF\b/i.test(e.title) && /trailer|bande/i.test(e.title));
-      const anyDubbed = all.find(e => /\bVF\b/i.test(e.title));
-      const nonVO = all.find(e => !/\bVO\b|VOSTFR/i.test(e.title) && /trailer|bande/i.test(e.title));
-      const best = vf || anyDubbed || nonVO || all[0];
-      const label = /\bVF\b/i.test(best.title) ? 'AlloCiné VF' : 'AlloCiné';
-      return await resolveDailymotion(best.id, label);
+      const videos = playerPages.filter(Boolean);
+      if (videos.length > 0) {
+        // Prefer VF (French dubbed), avoid VO/VOSTFR
+        const vf = videos.find(v => /\bVF\b/i.test(v.title));
+        const nonVO = videos.find(v => !/\bVO\b|VOSTFR/i.test(v.title));
+        const best = vf || nonVO || videos[0];
+        const label = /\bVF\b/i.test(best.title) ? 'AlloCiné VF' : 'AlloCiné';
+        const result = await resolveDailymotion(best.id, label);
+        if (result) return { ...result, localized: true };
+      }
     }
-
-    // Fallback: raw Dailymotion ID without title context
-    const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
-                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/);
-    if (dmMatch) return await resolveDailymotion(dmMatch[1], 'AlloCiné');
   } catch (e) { /* silent fail */ }
   return null;
 }
@@ -558,34 +570,56 @@ async function resolveFilmstarts(imdbId, meta) {
     const filmstartsId = meta?.wikidataIds?.filmstartsId;
     if (!filmstartsId) return null;
 
+    const ua = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
     const pageRes = await fetchWithTimeout(
       `https://www.filmstarts.de/kritiken/${filmstartsId}.html`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
+      { headers: ua }
     );
     if (!pageRes.ok) return null;
     let html = await pageRes.text();
-
-    // Decode HTML entities (same pattern as AlloCiné - same parent company)
     html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
 
-    // Find all video entries - prefer German dubbed over OV (Originalversion) / OmU (Original mit Untertiteln)
-    const entries = [...html.matchAll(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*?"title"\s*:\s*"([^"]+)"/g)];
-    const entriesRev = [...html.matchAll(/"title"\s*:\s*"([^"]+)"[^}]*?"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/g)]
-      .map(m => ({ id: m[2], title: m[1] }));
-    const all = [...entries.map(m => ({ id: m[1], title: m[2] })), ...entriesRev];
+    // Find cmedia IDs for this film's own videos
+    const cmediaIds = [...new Set(
+      [...html.matchAll(new RegExp(`cmedia=(\\d+)[^"]*cfilm=${filmstartsId}`, 'g'))].map(m => m[1])
+    )];
 
-    if (all.length > 0) {
-      // Prefer German dubbed: titles with "deutsch" or without OV/OmU/OmdU markers
-      const dubbed = all.find(e => /deutsch/i.test(e.title) && /trailer/i.test(e.title));
-      const nonOV = all.find(e => !/\bOV\b|\bOmU\b|\bOmdU\b/i.test(e.title) && /trailer/i.test(e.title));
-      const best = dubbed || nonOV || all[0];
-      return await resolveDailymotion(best.id, 'Filmstarts');
+    if (cmediaIds.length > 0) {
+      // Fetch up to 3 video player pages in parallel
+      const playerPages = await Promise.all(
+        cmediaIds.slice(0, 3).map(async (cmedia) => {
+          try {
+            const res = await fetchWithTimeout(
+              `https://www.filmstarts.de/video/player_gen_cmedia=${cmedia}&cfilm=${filmstartsId}.html`,
+              { headers: ua }, 5000
+            );
+            if (!res.ok) return null;
+            let ph = await res.text();
+            ph = ph.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+            const dm = ph.match(/idDailymotion[^a-zA-Z0-9]*([a-zA-Z0-9]{5,12})/);
+            const title = ph.match(/<title>([^<]+)/);
+            return dm ? { id: dm[1], title: title ? title[1] : '' } : null;
+          } catch { return null; }
+        })
+      );
+
+      const videos = playerPages.filter(Boolean);
+      if (videos.length > 0) {
+        // Prefer DF (Deutsche Fassung) or dubbed, avoid OV/OmU
+        const dubbed = videos.find(v => /\bDF\b|deutsch/i.test(v.title));
+        const nonOV = videos.find(v => !/\bOV\b|\bOmU\b|\bOmdU\b/i.test(v.title));
+        const best = dubbed || nonOV || videos[0];
+        const result = await resolveDailymotion(best.id, 'Filmstarts');
+        if (result) return { ...result, localized: true };
+      }
     }
 
-    // Fallback: raw Dailymotion ID
-    const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
-                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/);
-    if (dmMatch) return await resolveDailymotion(dmMatch[1], 'Filmstarts');
+    // Fallback: direct DM ID from main page (older approach)
+    const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/);
+    if (dmMatch) {
+      const result = await resolveDailymotion(dmMatch[1], 'Filmstarts');
+      if (result) return { ...result, localized: true };
+    }
   } catch (e) { /* silent fail */ }
   return null;
 }
@@ -607,13 +641,14 @@ async function resolveCSFD(imdbId, meta) {
     const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
                  || html.match(/data-video="([a-zA-Z0-9]+)"/);
     if (dmMatch) {
-      return await resolveDailymotion(dmMatch[1], 'CSFD');
+      const result = await resolveDailymotion(dmMatch[1], 'CSFD');
+      if (result) return { ...result, localized: true };
     }
 
     // Fallback: direct MP4 link
     const mp4Match = html.match(/(https?:\/\/[^"'\s]+\.mp4)/);
     if (mp4Match) {
-      return { url: mp4Match[1], provider: 'CSFD', bitrate: 0, width: 0, height: 0 };
+      return { url: mp4Match[1], provider: 'CSFD', bitrate: 0, width: 0, height: 0, localized: true };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -622,36 +657,33 @@ async function resolveCSFD(imdbId, meta) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v29:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v30:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
   }
 
-  const isEnglish = lang === 'en';
+  // PHASE 1: TMDB + IMDb in parallel (always both)
+  const [tmdbMeta, imdbResult] = await Promise.all([
+    getTMDBMetadata(imdbId, type),
+    resolveIMDb(imdbId)
+  ]);
 
-  // PHASE 1: TMDB find always + IMDb only for English
-  const phase1 = [getTMDBMetadata(imdbId, type)];
-  if (isEnglish) phase1.push(resolveIMDb(imdbId));
-  const [tmdbMeta, imdbResult] = await Promise.all(phase1);
-
-  // PHASE 2: Wikidata always + Plex only for English
-  const phase2 = [tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({})];
-  if (isEnglish) phase2.push(resolvePlex(imdbId, tmdbMeta));
-  const [wikidataIds, plexResult] = await Promise.all(phase2);
+  // PHASE 2: Wikidata + Plex in parallel (always both)
+  const [wikidataIds, plexResult] = await Promise.all([
+    tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({}),
+    resolvePlex(imdbId, tmdbMeta)
+  ]);
 
   const meta = { ...tmdbMeta, wikidataIds };
 
-  // PHASE 3: Build resolver array dynamically based on language
+  // PHASE 3: ALL sources in parallel - localized + English
   const phase3 = [
     resolveAppleTV(imdbId, meta, lang),
     resolveMUBI(imdbId, meta, lang),
+    resolveRottenTomatoes(imdbId, meta),
+    resolveFandango(imdbId, meta),
   ];
-
-  if (isEnglish) {
-    phase3.push(resolveRottenTomatoes(imdbId, meta));
-    phase3.push(resolveFandango(imdbId, meta));
-  }
 
   // Add language-specific local sources
   const localSources = LANG_CONFIG[lang]?.localSources || [];
@@ -663,17 +695,25 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
 
   // Collect all results
   const allResults = [...phase3Results];
-  if (isEnglish && plexResult) allResults.push(plexResult);
-  if (isEnglish && imdbResult) allResults.push(imdbResult);
+  if (plexResult) allResults.push(plexResult);
+  if (imdbResult) allResults.push(imdbResult);
 
   // Quality tier from largest dimension (aspect-ratio agnostic)
   const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
 
-  // Sort by quality tier first, then bitrate decides within same tier
+  // Sort: localized sources first, then by quality tier, then bitrate
+  const isLocalized = lang !== 'en';
   const seen = new Set();
   const links = allResults
     .filter(r => r !== null)
-    .sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate)
+    .sort((a, b) => {
+      // Localized sources always first when not English
+      if (isLocalized) {
+        if (a.localized && !b.localized) return -1;
+        if (!a.localized && b.localized) return 1;
+      }
+      return tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate;
+    })
     .filter(r => {
       if (seen.has(r.url)) return false;
       seen.add(r.url);
