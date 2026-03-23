@@ -623,6 +623,9 @@ function resolveAdoroCinema(imdbId, meta) {
 
 // ============== DAILYMOTION CHANNEL SEARCH (title-based fallback) ==============
 
+// Allowed words after movie title in video names (trailer keywords, numbers, articles, connectors)
+const DM_TITLE_NEXT = /^(trailer|teaser|bande|annonce|fragman|tráiler|clip|season|staffel|saison|s\d|2|3|4|5|6|ii|iii|iv|v|hd|4k|1080p|official|ufficiale|officiel|primer|primo|final|nuevo|nouveau|nuovo|the|of|and|in|at|vs|a|an|el|le|la|il|lo|der|die|das|o|e|y|et|und)\b/;
+
 async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe) {
   try {
     const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language&limit=10&sort=relevance`;
@@ -632,13 +635,19 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
     const videos = data.list || [];
     if (videos.length === 0) return null;
 
-    // Strict title matching: normalize and verify the movie title appears in video title
+    // Strict title matching: video must start with movie title,
+    // next word must be a trailer keyword or subtitle connector, NOT a different movie's name
     const normalize = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
     const movieTitle = normalize(searchTitle);
-    const matched = videos.filter(v => normalize(v.title).includes(movieTitle));
+    const matched = videos.filter(v => {
+      const vt = normalize(v.title);
+      if (!vt.startsWith(movieTitle)) return false;
+      const rest = vt.slice(movieTitle.length).trim();
+      return rest === '' || DM_TITLE_NEXT.test(rest);
+    });
     if (matched.length === 0) return null;
 
-    // Filter to trailer-like entries
+    // Filter to trailer-like entries, exclude junk
     const trailerRe = /trailer|bande|teaser|tráiler|fragman/i;
     const junkRe = /clip|behind|featurette|interview|review|crítica/i;
     const trailers = matched.filter(v => trailerRe.test(v.title) && !junkRe.test(v.title));
@@ -659,7 +668,7 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v33:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v34:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
