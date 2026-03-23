@@ -511,7 +511,7 @@ async function resolveDailymotion(dmVideoId, providerLabel) {
 
 // ============== LOCALIZED SOURCE RESOLVERS ==============
 
-// 7. AlloCiné - French dubbed trailers via Dailymotion
+// 7. AlloCiné - French dubbed (VF) trailers via Dailymotion
 async function resolveAllocine(imdbId, meta) {
   try {
     const allocineId = meta?.wikidataIds?.allocineId;
@@ -527,19 +527,27 @@ async function resolveAllocine(imdbId, meta) {
     // Decode HTML entities for embedded JSON (AlloCiné uses &quot; encoding)
     html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
 
-    // AlloCiné embeds Dailymotion video IDs in JSON as "idDailymotion":"xxx"
-    // Filter for trailer entries: look for file_type TRAILER with idDailymotion
-    const trailerDm = html.match(/"file_type"\s*:\s*"TRAILER"[^}]*"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
-                   || html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*"file_type"\s*:\s*"TRAILER"/);
-    if (trailerDm) return await resolveDailymotion(trailerDm[1], 'AlloCiné');
+    // Find all video entries with Dailymotion IDs and titles
+    // AlloCiné titles contain VF (Version Française = dubbed) or VO (Version Originale = original)
+    const entries = [...html.matchAll(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*?"title"\s*:\s*"([^"]+)"/g)];
+    const entriesRev = [...html.matchAll(/"title"\s*:\s*"([^"]+)"[^}]*?"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/g)]
+      .map(m => ({ id: m[2], title: m[1] }));
+    const all = [...entries.map(m => ({ id: m[1], title: m[2] })), ...entriesRev];
 
-    // Fallback: any Dailymotion ID on the page
+    if (all.length > 0) {
+      // Prefer VF (French dubbed), avoid VO/VOSTFR (original language)
+      const vf = all.find(e => /\bVF\b/i.test(e.title) && /trailer|bande/i.test(e.title));
+      const anyDubbed = all.find(e => /\bVF\b/i.test(e.title));
+      const nonVO = all.find(e => !/\bVO\b|VOSTFR/i.test(e.title) && /trailer|bande/i.test(e.title));
+      const best = vf || anyDubbed || nonVO || all[0];
+      const label = /\bVF\b/i.test(best.title) ? 'AlloCiné VF' : 'AlloCiné';
+      return await resolveDailymotion(best.id, label);
+    }
+
+    // Fallback: raw Dailymotion ID without title context
     const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
-                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
-                 || html.match(/data-video="([a-zA-Z0-9]+)"/);
-    if (!dmMatch) return null;
-
-    return await resolveDailymotion(dmMatch[1], 'AlloCiné');
+                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/);
+    if (dmMatch) return await resolveDailymotion(dmMatch[1], 'AlloCiné');
   } catch (e) { /* silent fail */ }
   return null;
 }
@@ -560,18 +568,24 @@ async function resolveFilmstarts(imdbId, meta) {
     // Decode HTML entities (same pattern as AlloCiné - same parent company)
     html = html.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'");
 
-    // Look for trailer Dailymotion IDs
-    const trailerDm = html.match(/"file_type"\s*:\s*"TRAILER"[^}]*"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
-                   || html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*"file_type"\s*:\s*"TRAILER"/);
-    if (trailerDm) return await resolveDailymotion(trailerDm[1], 'Filmstarts');
+    // Find all video entries - prefer German dubbed over OV (Originalversion) / OmU (Original mit Untertiteln)
+    const entries = [...html.matchAll(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"[^}]*?"title"\s*:\s*"([^"]+)"/g)];
+    const entriesRev = [...html.matchAll(/"title"\s*:\s*"([^"]+)"[^}]*?"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/g)]
+      .map(m => ({ id: m[2], title: m[1] }));
+    const all = [...entries.map(m => ({ id: m[1], title: m[2] })), ...entriesRev];
 
-    // Fallback: any Dailymotion ID
+    if (all.length > 0) {
+      // Prefer German dubbed: titles with "deutsch" or without OV/OmU/OmdU markers
+      const dubbed = all.find(e => /deutsch/i.test(e.title) && /trailer/i.test(e.title));
+      const nonOV = all.find(e => !/\bOV\b|\bOmU\b|\bOmdU\b/i.test(e.title) && /trailer/i.test(e.title));
+      const best = dubbed || nonOV || all[0];
+      return await resolveDailymotion(best.id, 'Filmstarts');
+    }
+
+    // Fallback: raw Dailymotion ID
     const dmMatch = html.match(/"idDailymotion"\s*:\s*"([a-zA-Z0-9]+)"/)
-                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
-                 || html.match(/data-video="([a-zA-Z0-9]+)"/);
-    if (!dmMatch) return null;
-
-    return await resolveDailymotion(dmMatch[1], 'Filmstarts');
+                 || html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/);
+    if (dmMatch) return await resolveDailymotion(dmMatch[1], 'Filmstarts');
   } catch (e) { /* silent fail */ }
   return null;
 }
