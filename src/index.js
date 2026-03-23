@@ -42,7 +42,7 @@ const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
 
 // ============== UTILITIES ==============
 
-async function fetchWithTimeout(url, options = {}, timeout = 8000) {
+async function fetchWithTimeout(url, options = {}, timeout = 5000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
   try {
@@ -128,7 +128,7 @@ async function getWikidataIds(wikidataId) {
     const res = await fetchWithTimeout(
       `https://www.wikidata.org/wiki/Special:EntityData/${wikidataId}.json`,
       { headers: { 'Accept': 'application/json', 'User-Agent': 'TrailerioLite/1.0' } },
-      10000
+      6000
     );
     const data = await res.json();
     const entity = data.entities?.[wikidataId];
@@ -196,9 +196,9 @@ async function resolveAppleTV(imdbId, meta, lang = 'en') {
 
     // Try each candidate, use feature.duration from master m3u8 to filter
     // Skip teasers (<60s) and full episodes (>300s)
-    for (const candidate of candidates) {
+    for (const candidate of candidates.slice(0, 3)) {
       try {
-        const m3u8Res = await fetchWithTimeout(candidate.url, {}, 5000);
+        const m3u8Res = await fetchWithTimeout(candidate.url, {}, 4000);
         const m3u8Text = await m3u8Res.text();
 
         // Check duration from master playlist metadata (no extra fetch needed)
@@ -334,7 +334,7 @@ async function resolveRottenTomatoes(imdbId, meta) {
           const smilUrl = videoUrl.split('?')[0] + '?format=SMIL';
           const smilRes = await fetchWithTimeout(smilUrl, {
             headers: { 'Accept': 'application/smil+xml' }
-          }, 5000);
+          }, 4000);
 
           if (smilRes.ok) {
             const smilXml = await smilRes.text();
@@ -387,7 +387,7 @@ async function resolveFandango(imdbId, meta) {
     const smilUrl = contentURL.split('?')[0] + '?format=SMIL&formats=mpeg4';
     const smilRes = await fetchWithTimeout(smilUrl, {
       headers: { 'Accept': 'application/smil+xml' }
-    }, 5000);
+    }, 4000);
 
     if (!smilRes.ok) return null;
 
@@ -560,7 +560,7 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
             try {
               const res = await fetchWithTimeout(
                 `${baseUrl}/video/player_gen_cmedia=${cmedia}&cfilm=${filmId}.html`,
-                { headers: UA }, 5000
+                { headers: UA }, 4000
               );
               if (!res.ok) return null;
               let ph = decodeEntities(await res.text());
@@ -625,48 +625,88 @@ function resolveAdoroCinema(meta) {
 
 // ============== MAIN RESOLVER ==============
 
+// Deferred promise: lets downstream consumers await a value that upstream will resolve later
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v39:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v40:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
   }
 
-  // PHASE 1: TMDB + IMDb in parallel (always both)
-  const [tmdbMeta, imdbResult] = await Promise.all([
-    getTMDBMetadata(imdbId, type),
-    resolveIMDb(imdbId)
-  ]);
+  // Shared deferred signals - sources await these instead of blocking in phases
+  const metaReady = deferred();     // resolves with { tmdbMeta, wikidataIds }
+  const tmdbReady = deferred();     // resolves with tmdbMeta (for Plex actualType)
 
-  // PHASE 2: Wikidata + Plex in parallel (always both)
-  const [wikidataIds, plexResult] = await Promise.all([
-    tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({}),
-    resolvePlex(imdbId, tmdbMeta)
-  ]);
+  // ---------- METADATA PIPELINE (runs as one task) ----------
+  // TMDB find → external_ids → Wikidata: chained but non-blocking to sources
+  const metaPipeline = (async () => {
+    const tmdbMeta = await getTMDBMetadata(imdbId, type);
+    tmdbReady.resolve(tmdbMeta);  // unblocks Plex immediately
 
-  const meta = { ...tmdbMeta, wikidataIds };
+    const wikidataIds = tmdbMeta?.wikidataId
+      ? await getWikidataIds(tmdbMeta.wikidataId)
+      : {};
+    metaReady.resolve({ tmdbMeta, wikidataIds });  // unblocks all Phase 3 sources
+    return { tmdbMeta, wikidataIds };
+  })();
 
-  // PHASE 3: ALL sources in parallel - localized + English
-  const phase3 = [
-    resolveAppleTV(imdbId, meta, lang),
-    resolveMUBI(imdbId, meta, lang),
-    resolveRottenTomatoes(imdbId, meta),
-    resolveFandango(imdbId, meta),
+  // ---------- ALL SOURCES IN PARALLEL (no phases, no waterfall) ----------
+  const sources = [
+    // IMDb - needs nothing, starts immediately
+    resolveIMDb(imdbId),
+
+    // Plex - only needs actualType from TMDB, starts as soon as TMDB find completes
+    (async () => {
+      const tmdbMeta = await tmdbReady.promise;
+      return resolvePlex(imdbId, tmdbMeta);
+    })(),
+
+    // Apple TV, MUBI, RT, Fandango - need wikidataIds, start as soon as Wikidata completes
+    (async () => {
+      const { tmdbMeta, wikidataIds } = await metaReady.promise;
+      return resolveAppleTV(imdbId, { ...tmdbMeta, wikidataIds }, lang);
+    })(),
+    (async () => {
+      const { tmdbMeta, wikidataIds } = await metaReady.promise;
+      return resolveMUBI(imdbId, { ...tmdbMeta, wikidataIds }, lang);
+    })(),
+    (async () => {
+      const { tmdbMeta, wikidataIds } = await metaReady.promise;
+      return resolveRottenTomatoes(imdbId, { ...tmdbMeta, wikidataIds });
+    })(),
+    (async () => {
+      const { tmdbMeta, wikidataIds } = await metaReady.promise;
+      return resolveFandango(imdbId, { ...tmdbMeta, wikidataIds });
+    })(),
   ];
 
-  // Add language-specific local sources (Webedia network)
+  // Language-specific local sources (Webedia network) - also await metaReady
   const localSources = LANG_CONFIG[lang]?.localSources || [];
-  if (localSources.includes('allocine')) phase3.push(resolveAllocine(meta));
-  if (localSources.includes('filmstarts')) phase3.push(resolveFilmstarts(meta));
-  if (localSources.includes('sensacine')) phase3.push(resolveSensaCine(meta));
-  if (localSources.includes('adorocinema')) phase3.push(resolveAdoroCinema(meta));
+  if (localSources.includes('allocine')) sources.push((async () => {
+    const { tmdbMeta, wikidataIds } = await metaReady.promise;
+    return resolveAllocine({ ...tmdbMeta, wikidataIds });
+  })());
+  if (localSources.includes('filmstarts')) sources.push((async () => {
+    const { tmdbMeta, wikidataIds } = await metaReady.promise;
+    return resolveFilmstarts({ ...tmdbMeta, wikidataIds });
+  })());
+  if (localSources.includes('sensacine')) sources.push((async () => {
+    const { tmdbMeta, wikidataIds } = await metaReady.promise;
+    return resolveSensaCine({ ...tmdbMeta, wikidataIds });
+  })());
+  if (localSources.includes('adorocinema')) sources.push((async () => {
+    const { tmdbMeta, wikidataIds } = await metaReady.promise;
+    return resolveAdoroCinema({ ...tmdbMeta, wikidataIds });
+  })());
 
-  const phase3Results = await Promise.all(phase3);
-
-  // Collect all results
-  const allResults = [...phase3Results];
-  if (plexResult) allResults.push(plexResult);
-  if (imdbResult) allResults.push(imdbResult);
+  // Wait for everything (metadata pipeline + all sources) concurrently
+  const [metaResult, ...allResults] = await Promise.all([metaPipeline, ...sources]);
 
   // Quality tier from largest dimension (aspect-ratio agnostic)
   const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
@@ -677,7 +717,6 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
   const links = allResults
     .filter(r => r !== null)
     .sort((a, b) => {
-      // Localized sources always first when not English
       if (isLocalized) {
         if (a.localized && !b.localized) return -1;
         if (!a.localized && b.localized) return 1;
@@ -695,7 +734,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
     }));
 
   const result = {
-    title: meta?.title || imdbId,
+    title: metaResult?.tmdbMeta?.title || imdbId,
     links: links
   };
 
