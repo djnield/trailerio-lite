@@ -626,7 +626,7 @@ function resolveAdoroCinema(imdbId, meta) {
 
 async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe, env) {
   try {
-    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language,duration&limit=10&sort=relevance`;
+    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,description,language,duration&limit=10&sort=relevance`;
     const res = await fetchWithTimeout(searchUrl, {}, 5000);
     if (!res.ok) return null;
     const data = await res.json();
@@ -638,10 +638,13 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
     if (candidates.length === 0) return null;
 
     // LLM title matching — replaces all regex heuristics
-    const videoList = candidates.map((v, i) => `${i + 1}. "${v.title}" (${v.duration}s)`).join('\n');
+    const videoList = candidates.map((v, i) => {
+      const desc = v.description ? ` - ${v.description.replace(/<[^>]*>/g, '').slice(0, 100)}` : '';
+      return `${i + 1}. "${v.title}" (${v.duration}s)${desc}`;
+    }).join('\n');
     const aiResult = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
       messages: [{ role: 'user', content:
-        `Which of these videos are trailers or teasers for "${searchTitle}"? Not for sequels, spinoffs, or different titles. Reply with ONLY the matching numbers comma-separated, or "none".\n\n${videoList}` }],
+        `Which of these are official trailers (trailer/bande-annonce) for "${searchTitle}"? NOT teasers, clips, interviews, or different titles. Reply with ONLY the matching numbers comma-separated, or "none".\n\n${videoList}` }],
       max_tokens: 32
     });
 
@@ -667,7 +670,7 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', env = null) {
-  const cacheKey = `trailer:v37:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v38:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
