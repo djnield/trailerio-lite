@@ -1,23 +1,39 @@
 // Trailerio Lite - Cloudflare Workers Edition
 // Zero storage, edge-deployed trailer resolver for Fusion
 
-const MANIFEST = {
-  id: 'io.trailerio.lite',
-  version: '1.2.0',
-  name: 'Trailerio',
-  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb',
-  logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
-  resources: [
-    {
-      name: 'meta',
-      types: ['movie', 'series'],
-      idPrefixes: ['tt']
-    }
-  ],
-  types: ['movie', 'series'],
-  idPrefixes: ['tt'],
-  catalogs: []
+// Language configuration - add a new language by adding one line
+const LANG_CONFIG = {
+  en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
+  fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'] },
+  de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'] },
+  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano' },
+  es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español' },
+  pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português' },
+  ru: { appleCountry: 'ru', mubiCountry: 'RU', label: 'Русский' },
+  ja: { appleCountry: 'jp', mubiCountry: 'JP', label: '日本語' },
+  ko: { appleCountry: 'kr', mubiCountry: 'KR', label: '한국어' },
+  cs: { appleCountry: 'cz', mubiCountry: 'CZ', label: 'Čeština', localSources: ['csfd'] },
+  hi: { appleCountry: 'in', mubiCountry: 'IN', label: 'हिन्दी' },
 };
+
+const LANG_CODES = Object.keys(LANG_CONFIG).filter(k => k !== 'en');
+
+function getManifest(lang) {
+  const config = LANG_CONFIG[lang] || LANG_CONFIG.en;
+  return {
+    id: lang === 'en' ? 'io.trailerio.lite' : `io.trailerio.lite.${lang}`,
+    version: '1.3.0',
+    name: lang === 'en' ? 'Trailerio' : `Trailerio ${config.label}`,
+    description: lang === 'en'
+      ? 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb'
+      : `Trailer addon - ${config.label} dubbed trailers`,
+    logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
+    resources: [{ name: 'meta', types: ['movie', 'series'], idPrefixes: ['tt'] }],
+    types: ['movie', 'series'],
+    idPrefixes: ['tt'],
+    catalogs: []
+  };
+}
 
 const CACHE_TTL = 86400; // 24 hours
 const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
@@ -125,7 +141,11 @@ async function getWikidataIds(wikidataId) {
       isAppleTvShow: !!appleTvShowId && !appleTvMovieId,
       rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value,
       fandangoId: entity.claims?.P5693?.[0]?.mainsnak?.datavalue?.value,
-      mubiId: entity.claims?.P7299?.[0]?.mainsnak?.datavalue?.value
+      mubiId: entity.claims?.P7299?.[0]?.mainsnak?.datavalue?.value,
+      // Localized sources
+      allocineId: entity.claims?.P1265?.[0]?.mainsnak?.datavalue?.value,
+      filmstartsId: entity.claims?.P8531?.[0]?.mainsnak?.datavalue?.value,
+      csfdId: entity.claims?.P2529?.[0]?.mainsnak?.datavalue?.value
     };
   } catch (e) {
     return {};
@@ -134,17 +154,17 @@ async function getWikidataIds(wikidataId) {
 
 // ============== SOURCE RESOLVERS ==============
 
-// 1. Apple TV - 4K HLS trailers
-async function resolveAppleTV(imdbId, meta) {
+// 1. Apple TV - 4K HLS trailers (localized by country code)
+async function resolveAppleTV(imdbId, meta, lang = 'en') {
   try {
     let appleId = meta?.wikidataIds?.appleTvId;
     if (!appleId) return null;
 
-    // TV shows use /show/ path, movies use /movie/ path
+    const country = LANG_CONFIG[lang]?.appleCountry || 'us';
     const isShow = meta?.wikidataIds?.isAppleTvShow;
     const pageUrl = isShow
-      ? `https://tv.apple.com/us/show/${appleId}`
-      : `https://tv.apple.com/us/movie/${appleId}`;
+      ? `https://tv.apple.com/${country}/show/${appleId}`
+      : `https://tv.apple.com/${country}/movie/${appleId}`;
 
     const pageRes = await fetchWithTimeout(
       pageUrl,
@@ -379,15 +399,16 @@ async function resolveFandango(imdbId, meta) {
   return null;
 }
 
-// 5. MUBI - Direct API with MP4 trailers
-async function resolveMUBI(imdbId, meta) {
+// 5. MUBI - Direct API with MP4 trailers (localized by country)
+async function resolveMUBI(imdbId, meta, lang = 'en') {
   try {
     const mubiId = meta?.wikidataIds?.mubiId;
     if (!mubiId) return null;
 
+    const country = LANG_CONFIG[lang]?.mubiCountry || 'US';
     const res = await fetchWithTimeout(
       `https://api.mubi.com/v3/films/${mubiId}`,
-      { headers: { 'CLIENT': 'web', 'CLIENT_COUNTRY': 'US' } }
+      { headers: { 'CLIENT': 'web', 'CLIENT_COUNTRY': country } }
     );
     if (!res.ok) return null;
 
@@ -442,43 +463,171 @@ async function resolveIMDb(imdbId) {
   return null;
 }
 
+// ============== DAILYMOTION RESOLVER (shared utility) ==============
+
+async function resolveDailymotion(dmVideoId, providerLabel) {
+  try {
+    const metaRes = await fetchWithTimeout(
+      `https://www.dailymotion.com/player/metadata/video/${dmVideoId}`,
+      { headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Cookie': 'family_filter=off; ff=off'
+      }}
+    );
+    if (!metaRes.ok) return null;
+    const data = await metaRes.json();
+
+    const qualities = data.qualities;
+    if (!qualities) return null;
+
+    for (const res of ['1080', '720', '480', '380', '240']) {
+      const streams = qualities[res];
+      if (!streams) continue;
+      const mp4 = streams.find(s => s.type === 'video/mp4') || streams[0];
+      if (mp4?.url) {
+        const height = parseInt(res);
+        return {
+          url: mp4.url,
+          provider: `${providerLabel} ${res}p`,
+          bitrate: 0,
+          width: Math.round(height * 16 / 9),
+          height
+        };
+      }
+    }
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// ============== LOCALIZED SOURCE RESOLVERS ==============
+
+// 7. AlloCiné - French dubbed trailers via Dailymotion
+async function resolveAllocine(imdbId, meta) {
+  try {
+    const allocineId = meta?.wikidataIds?.allocineId;
+    if (!allocineId) return null;
+
+    const pageRes = await fetchWithTimeout(
+      `https://www.allocine.fr/film/fichefilm_gen_cfilm=${allocineId}.html`,
+      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
+    );
+    if (!pageRes.ok) return null;
+    const html = await pageRes.text();
+
+    // AlloCiné embeds Dailymotion videos
+    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
+                 || html.match(/data-video="([a-zA-Z0-9]+)"/);
+    if (!dmMatch) return null;
+
+    return await resolveDailymotion(dmMatch[1], 'AlloCiné');
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// 8. Filmstarts.de - German dubbed trailers via Dailymotion
+async function resolveFilmstarts(imdbId, meta) {
+  try {
+    const filmstartsId = meta?.wikidataIds?.filmstartsId;
+    if (!filmstartsId) return null;
+
+    const pageRes = await fetchWithTimeout(
+      `https://www.filmstarts.de/kritiken/${filmstartsId}/`,
+      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
+    );
+    if (!pageRes.ok) return null;
+    const html = await pageRes.text();
+
+    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
+                 || html.match(/data-video="([a-zA-Z0-9]+)"/);
+    if (!dmMatch) return null;
+
+    return await resolveDailymotion(dmMatch[1], 'Filmstarts');
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// 9. CSFD.cz - Czech/Slovak trailers
+async function resolveCSFD(imdbId, meta) {
+  try {
+    const csfdId = meta?.wikidataIds?.csfdId;
+    if (!csfdId) return null;
+
+    const pageRes = await fetchWithTimeout(
+      `https://www.csfd.cz/film/${csfdId}/videa/`,
+      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
+    );
+    if (!pageRes.ok) return null;
+    const html = await pageRes.text();
+
+    // Check for Dailymotion embed first
+    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/)
+                 || html.match(/data-video="([a-zA-Z0-9]+)"/);
+    if (dmMatch) {
+      return await resolveDailymotion(dmMatch[1], 'CSFD');
+    }
+
+    // Fallback: direct MP4 link
+    const mp4Match = html.match(/(https?:\/\/[^"'\s]+\.mp4)/);
+    if (mp4Match) {
+      return { url: mp4Match[1], provider: 'CSFD', bitrate: 0, width: 0, height: 0 };
+    }
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
 // ============== MAIN RESOLVER ==============
 
-async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v27:${imdbId}`;
+async function resolveTrailers(imdbId, type, cache, lang = 'en') {
+  const cacheKey = `trailer:v28:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
   }
 
-  // PHASE 1: Start IMDb immediately (needs nothing) + TMDB find in parallel
-  const [imdbResult, tmdbMeta] = await Promise.all([
-    resolveIMDb(imdbId),
-    getTMDBMetadata(imdbId, type)
-  ]);
+  const isEnglish = lang === 'en';
 
-  // PHASE 2: Start Plex (needs actualType) + Wikidata lookup in parallel
-  const [plexResult, wikidataIds] = await Promise.all([
-    resolvePlex(imdbId, tmdbMeta),
-    tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({})
-  ]);
+  // PHASE 1: TMDB find always + IMDb only for English
+  const phase1 = [getTMDBMetadata(imdbId, type)];
+  if (isEnglish) phase1.push(resolveIMDb(imdbId));
+  const [tmdbMeta, imdbResult] = await Promise.all(phase1);
+
+  // PHASE 2: Wikidata always + Plex only for English
+  const phase2 = [tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({})];
+  if (isEnglish) phase2.push(resolvePlex(imdbId, tmdbMeta));
+  const [wikidataIds, plexResult] = await Promise.all(phase2);
 
   const meta = { ...tmdbMeta, wikidataIds };
 
-  // PHASE 3: Start Apple TV + RT + Fandango + MUBI in parallel (need Wikidata IDs)
-  const [appleTvResult, rtResult, fandangoResult, mubiResult] = await Promise.all([
-    resolveAppleTV(imdbId, meta),
-    resolveRottenTomatoes(imdbId, meta),
-    resolveFandango(imdbId, meta),
-    resolveMUBI(imdbId, meta)
-  ]);
+  // PHASE 3: Build resolver array dynamically based on language
+  const phase3 = [
+    resolveAppleTV(imdbId, meta, lang),
+    resolveMUBI(imdbId, meta, lang),
+  ];
+
+  if (isEnglish) {
+    phase3.push(resolveRottenTomatoes(imdbId, meta));
+    phase3.push(resolveFandango(imdbId, meta));
+  }
+
+  // Add language-specific local sources
+  const localSources = LANG_CONFIG[lang]?.localSources || [];
+  if (localSources.includes('allocine')) phase3.push(resolveAllocine(imdbId, meta));
+  if (localSources.includes('filmstarts')) phase3.push(resolveFilmstarts(imdbId, meta));
+  if (localSources.includes('csfd')) phase3.push(resolveCSFD(imdbId, meta));
+
+  const phase3Results = await Promise.all(phase3);
+
+  // Collect all results
+  const allResults = [...phase3Results];
+  if (isEnglish && plexResult) allResults.push(plexResult);
+  if (isEnglish && imdbResult) allResults.push(imdbResult);
 
   // Quality tier from largest dimension (aspect-ratio agnostic)
   const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
 
   // Sort by quality tier first, then bitrate decides within same tier
   const seen = new Set();
-  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, imdbResult]
+  const links = allResults
     .filter(r => r !== null)
     .sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate)
     .filter(r => {
@@ -524,23 +673,33 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
+    // Parse optional language prefix: /{lang}/...
+    let lang = 'en';
+    let pathname = url.pathname;
+    const langRegex = new RegExp(`^\\/(${LANG_CODES.join('|')})\\/`);
+    const langMatch = pathname.match(langRegex);
+    if (langMatch) {
+      lang = langMatch[1];
+      pathname = pathname.slice(langMatch[0].length - 1); // strip prefix, keep leading /
+    }
+
     // Manifest
-    if (url.pathname === '/manifest.json') {
-      return new Response(JSON.stringify(MANIFEST), { headers: corsHeaders });
+    if (pathname === '/manifest.json') {
+      return new Response(JSON.stringify(getManifest(lang)), { headers: corsHeaders });
     }
 
     // Health check
-    if (url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', edge: request.cf?.colo }), { headers: corsHeaders });
+    if (pathname === '/health') {
+      return new Response(JSON.stringify({ status: 'ok', edge: request.cf?.colo, lang }), { headers: corsHeaders });
     }
 
     // Meta endpoint: /meta/{type}/{id}.json
-    const metaMatch = url.pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
+    const metaMatch = pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
     if (metaMatch) {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const result = await resolveTrailers(imdbId, type, cache);
+      const result = await resolveTrailers(imdbId, type, cache, lang);
 
       return new Response(JSON.stringify({
         meta: {
