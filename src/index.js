@@ -624,7 +624,7 @@ function resolveAdoroCinema(imdbId, meta) {
 // ============== DAILYMOTION CHANNEL SEARCH (title-based fallback) ==============
 
 // Allowed words after movie title in video names (trailer keywords, numbers, articles, connectors)
-const DM_TITLE_NEXT = /^(trailer|teaser|bande|annonce|fragman|tráiler|clip|season|staffel|saison|s\d|2|3|4|5|6|ii|iii|iv|v|hd|4k|1080p|official|ufficiale|officiel|primer|primo|final|nuevo|nouveau|nuovo|the|of|and|in|at|vs|a|an|el|le|la|il|lo|der|die|das|o|e|y|et|und)\b/;
+const DM_TITLE_NEXT = /^(trailer|teaser|bande|annonce|fragman|tráiler|clip|hd|4k|1080p|official|ufficiale|officiel|primer|primo|final|nuevo|nouveau|nuovo|the|of|and|in|at|vs|a|an|el|le|la|il|lo|der|die|das|o|e|y|et|und)\b/;
 
 async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe) {
   try {
@@ -676,7 +676,7 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v35:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v36:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
