@@ -628,7 +628,8 @@ const DM_TITLE_NEXT = /^(trailer|teaser|bande|annonce|fragman|tráiler|clip|seas
 
 async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe) {
   try {
-    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language&limit=10&sort=relevance`;
+    // Request duration field for trailer-length validation (expert strategy)
+    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language,duration&limit=10&sort=relevance`;
     const res = await fetchWithTimeout(searchUrl, {}, 5000);
     if (!res.ok) return null;
     const data = await res.json();
@@ -639,7 +640,10 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
     // next word must be a trailer keyword or subtitle connector, NOT a different movie's name
     const normalize = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
     const movieTitle = normalize(searchTitle);
+    const titleWords = movieTitle.split(' ').length;
     const matched = videos.filter(v => {
+      // Duration gate: trailers are 30s-5min, reject clips/compilations
+      if (v.duration && (v.duration < 30 || v.duration > 300)) return false;
       const vt = normalize(v.title);
       if (!vt.startsWith(movieTitle)) return false;
       const rest = vt.slice(movieTitle.length).trim();
@@ -649,9 +653,13 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
 
     // Filter to trailer-like entries, exclude junk
     const trailerRe = /trailer|bande|teaser|tráiler|fragman/i;
-    const junkRe = /clip|behind|featurette|interview|review|crítica/i;
+    const junkRe = /clip|behind|featurette|interview|review|crítica|react|reaction|explained|recap|parody/i;
     const trailers = matched.filter(v => trailerRe.test(v.title) && !junkRe.test(v.title));
-    const pool = trailers.length > 0 ? trailers : matched;
+    // Short titles (1-2 words like "It", "Us", "Up", "Cars") MUST have trailer keyword
+    // This prevents matching "Cars 2" when searching for "Cars", etc.
+    const pool = (trailers.length > 0) ? trailers
+      : (titleWords >= 3 ? matched : []);
+    if (pool.length === 0) return null;
 
     // Prefer dubbed version
     const dubbed = dubbedRe ? pool.find(v => dubbedRe.test(v.title)) : null;
@@ -668,7 +676,7 @@ async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalR
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v34:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v35:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
