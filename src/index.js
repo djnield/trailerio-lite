@@ -4,18 +4,18 @@
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
   en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
-  fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'] },
-  de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'] },
-  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano' },
-  es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'] },
-  pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português', localSources: ['adorocinema'] },
+  fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dmChannel: 'allocine', dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|VOSTFR/i },
+  de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'], dmChannel: 'FILMSTARTS', dubbedRe: /\bDF\b|deutsch/i, originalRe: /\bOV\b|\bOmU\b/i },
+  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano', dmChannel: 'mymoviesit' },
+  es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'], dmChannel: 'sensacine' },
+  pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português', localSources: ['adorocinema'], dmChannel: 'adorocinema', dubbedRe: /dublad/i, originalRe: /original|legendad/i },
   ru: { appleCountry: 'ru', mubiCountry: 'RU', label: 'Русский' },
   ja: { appleCountry: 'jp', mubiCountry: 'JP', label: '日本語' },
   ko: { appleCountry: 'kr', mubiCountry: 'KR', label: '한국어' },
   cs: { appleCountry: 'cz', mubiCountry: 'CZ', label: 'Čeština' },
   hi: { appleCountry: 'in', mubiCountry: 'IN', label: 'हिन्दी' },
-  tr: { appleCountry: 'tr', mubiCountry: 'TR', label: 'Türkçe' },
-  ar: { appleCountry: 'sa', mubiCountry: 'SA', label: 'العربية' },
+  tr: { appleCountry: 'tr', mubiCountry: 'TR', label: 'Türkçe', dmChannel: 'beyazperde' },
+  ar: { appleCountry: 'ae', mubiCountry: 'AE', label: 'العربية' },
 };
 
 const LANG_CODES = Object.keys(LANG_CONFIG).filter(k => k !== 'en');
@@ -621,10 +621,39 @@ function resolveAdoroCinema(imdbId, meta) {
   );
 }
 
+// ============== DAILYMOTION CHANNEL SEARCH (title-based fallback) ==============
+
+async function resolveDMChannel(channel, searchTitle, label, dubbedRe, originalRe) {
+  try {
+    const searchUrl = `https://api.dailymotion.com/user/${channel}/videos?search=${encodeURIComponent(searchTitle)}&fields=id,title,language&limit=5&sort=relevance`;
+    const res = await fetchWithTimeout(searchUrl, {}, 5000);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const videos = data.list || [];
+    if (videos.length === 0) return null;
+
+    // Filter to trailer-like entries
+    const trailerRe = /trailer|bande|teaser|tráiler|fragman/i;
+    const junkRe = /clip|behind|featurette|interview|review|crítica/i;
+    const trailers = videos.filter(v => trailerRe.test(v.title) && !junkRe.test(v.title));
+    const pool = trailers.length > 0 ? trailers : videos;
+
+    // Prefer dubbed version
+    const dubbed = dubbedRe ? pool.find(v => dubbedRe.test(v.title)) : null;
+    const nonOrig = originalRe ? pool.find(v => !originalRe.test(v.title)) : pool[0];
+    const best = dubbed || nonOrig || pool[0];
+
+    const tag = dubbed ? `${label} dubbed` : label;
+    const result = await resolveDailymotion(best.id, tag);
+    if (result) return { ...result, localized: true };
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v31:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v32:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -658,6 +687,12 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
   if (localSources.includes('filmstarts')) phase3.push(resolveFilmstarts(imdbId, meta));
   if (localSources.includes('sensacine')) phase3.push(resolveSensaCine(imdbId, meta));
   if (localSources.includes('adorocinema')) phase3.push(resolveAdoroCinema(imdbId, meta));
+
+  // DM channel search fallback (title-based, works when Wikidata IDs are missing)
+  const dmConfig = LANG_CONFIG[lang];
+  if (dmConfig?.dmChannel && meta?.title) {
+    phase3.push(resolveDMChannel(dmConfig.dmChannel, meta.title, dmConfig.label, dmConfig.dubbedRe, dmConfig.originalRe));
+  }
 
   const phase3Results = await Promise.all(phase3);
 
