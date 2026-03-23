@@ -622,7 +622,7 @@ async function resolveCSFD(imdbId, meta) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v28:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v29:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
