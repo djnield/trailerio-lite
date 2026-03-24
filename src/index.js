@@ -11,7 +11,7 @@ const LANG_CONFIG = {
   en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
   fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|VOSTFR/i },
   de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'], dubbedRe: /\bDF\b|deutsch/i, originalRe: /\bOV\b|\bOmU\b/i },
-  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano', localSources: ['mymovies', 'movieplayer'], dubbedRe: /italiano|\bita\b/i, originalRe: /\bVO\b|\bOV\b|originale|sottotitol/i },
+  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano', localSources: ['mymovies'], dubbedRe: /italiano|\bita\b/i, originalRe: /\bVO\b|\bOV\b|originale|sottotitol/i },
   es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'] },
   pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português', localSources: ['adorocinema'], dubbedRe: /dublad/i, originalRe: /original|legendad/i },
   ru: { appleCountry: 'ru', mubiCountry: 'RU', label: 'Русский' },
@@ -148,7 +148,7 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en', db = null) {
         const score = v => (v.type === 'Trailer' ? 0 : v.type === 'Teaser' ? 1 : 2);
         return score(a) - score(b);
       });
-    const youtubeKeys = ytVideos.slice(0, 3).map(v => v.key);
+    const youtubeKeys = ytVideos.slice(0, 1).map(v => v.key);
 
     const tmdbMeta = {
       tmdbId,
@@ -201,8 +201,6 @@ async function getWikidataIds(wikidataId, db = null) {
       malId: entity.claims?.P4086?.[0]?.mainsnak?.datavalue?.value,
       // Italian sources
       mymoviesId: entity.claims?.P4780?.[0]?.mainsnak?.datavalue?.value,
-      movieplayerFilmId: entity.claims?.P4783?.[0]?.mainsnak?.datavalue?.value,
-      movieplayerSeriesId: entity.claims?.P4784?.[0]?.mainsnak?.datavalue?.value,
     };
     d1Set(db, d1Key, ids, 604800); // 7 days, fire-and-forget
     return ids;
@@ -525,7 +523,7 @@ async function resolveIMDb(imdbId) {
   try {
     // Step 1: Get first trailer video ID via GraphQL (4s timeout)
     const galleryQuery = {
-      query: `query Q($c:ID!){title(id:$c){videoGallery(first:5){edges{node{id contentType{displayName{value}}}}}}}`,
+      query: `query Q($c:ID!){title(id:$c){primaryVideos(first:5){edges{node{id contentType{displayName{value}}}}}}}`,
       operationName: 'Q',
       variables: { c: imdbId },
     };
@@ -538,7 +536,7 @@ async function resolveIMDb(imdbId) {
     if (!galleryRes.ok) return null;
 
     const galleryData = await galleryRes.json();
-    const edges = galleryData?.data?.title?.videoGallery?.edges || [];
+    const edges = galleryData?.data?.title?.primaryVideos?.edges || [];
     const trailerEdge = edges.find(e => /trailer/i.test(e.node?.contentType?.displayName?.value)) || edges[0];
     if (!trailerEdge) return null;
 
@@ -731,21 +729,45 @@ let _poTokenType = 'none'; // 'full', 'cold-start', or 'none'
 let _poTokenError = null;
 let _visitorData = null;
 
-async function getPoToken() {
-  // Return cached token if still valid (with 5 min buffer)
+async function getPoToken(db = null) {
+  // Return in-memory cached token if still valid (with 5 min buffer)
   if (_poToken && Date.now() < _poTokenExpiry - 300000) {
     return { poToken: _poToken, visitorData: _visitorData };
   }
 
-  try {
-    // Generate visitor_data if we don't have one
-    if (!_visitorData) {
-      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-      let id = '';
-      for (let i = 0; i < 11; i++) id += chars[Math.floor(Math.random() * chars.length)];
-      _visitorData = id;
-    }
+  // Check D1 for cached po_token (survives cold starts)
+  const d1Cached = await d1Get(db, 'yt:potoken');
+  if (d1Cached && d1Cached.expiry > Date.now()) {
+    _poToken = d1Cached.poToken;
+    _visitorData = d1Cached.visitorData;
+    _poTokenExpiry = d1Cached.expiry;
+    _poTokenType = d1Cached.type || 'd1-cached';
+    return { poToken: _poToken, visitorData: _visitorData };
+  }
 
+  // Generate visitor_data if we don't have one
+  if (!_visitorData) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let id = '';
+    for (let i = 0; i < 11; i++) id += chars[Math.floor(Math.random() * chars.length)];
+    _visitorData = id;
+  }
+
+  // Fast path: use cold-start token immediately (skips BotGuard CPU entirely)
+  // Cold-start tokens work during YouTube's SPS=2 grace period
+  const coldToken = BG.PoToken.generateColdStartToken(_visitorData);
+  _poToken = coldToken;
+  _poTokenExpiry = Date.now() + 600000; // 10 min
+  _poTokenType = 'cold-start';
+  // Cache cold-start token in D1 so even this is skipped next time
+  d1Set(db, 'yt:potoken', { poToken: coldToken, visitorData: _visitorData, expiry: _poTokenExpiry, type: 'cold-start' }, 600);
+  return { poToken: coldToken, visitorData: _visitorData };
+
+  // NOTE: Full BotGuard minting removed — cold-start token is sufficient for trailer resolution
+  // and eliminates the QuickJS WASM CPU bottleneck that causes 503 errors on the free plan.
+  // If YouTube starts rejecting cold-start tokens, re-enable BotGuard minting below.
+
+  try {
     const bgEnv = createBotGuardEnv();
 
     const bgConfig = {
@@ -957,7 +979,7 @@ async function getPoToken() {
 // Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
 // IOS returns pre-signed adaptive URLs (1080p H.264), least blocked from datacenter IPs
 // ANDROID has pre-signed URLs too; WEB has most formats but gets 403'd more often
-const YOUTUBE_CLIENTS = ['IOS', 'ANDROID', 'WEB'];
+const YOUTUBE_CLIENTS = ['IOS'];
 
 // Get URL from format — use direct URL if available, decipher only when needed
 async function getFormatUrl(f, player) {
@@ -971,46 +993,19 @@ let _innertube = null;
 let _innertubeRefresh = 0;
 let _quickjs = null;
 
-async function getInnertube() {
+async function getInnertube(db = null) {
   const now = Date.now();
   // Refresh session every 15 minutes (player JS changes, sessions expire)
   if (_innertube && now - _innertubeRefresh < 15 * 60 * 1000) return _innertube;
 
-  // Initialize QuickJS WASM once
-  if (!_quickjs) _quickjs = await getQuickJSWASMModule();
-
   // Fix Cloudflare Workers "Illegal invocation" — wrap fetch to preserve `this` binding
   Platform.shim.fetch = (input, init) => fetch(input, init);
 
-  // Set up custom eval shim — replaces blocked native eval()/new Function()
-  // YouTube.js uses Platform.shim.eval(data, env) for sig/nsig deciphering
-  Platform.shim.eval = async (data, env) => {
-    const vm = _quickjs.newContext();
-    try {
-      let code = '';
-      for (const [key, value] of Object.entries(env || {})) {
-        code += `var ${key} = ${JSON.stringify(value)};\n`;
-      }
-      code += data.output;
-      const result = vm.evalCode(code);
-      if (result.error) {
-        const err = vm.dump(result.error);
-        result.error.dispose();
-        throw new Error(`QuickJS: ${JSON.stringify(err)}`);
-      }
-      const value = vm.dump(result.value);
-      result.value.dispose();
-      return value;
-    } finally {
-      vm.dispose();
-    }
-  };
-
   // Get po_token for bot attestation (reduces 403s from datacenter IPs)
-  const { poToken, visitorData } = await getPoToken();
+  const { poToken, visitorData } = await getPoToken(db);
 
   const createOpts = {
-    retrieve_player: true,
+    retrieve_player: false, // IOS client returns pre-signed URLs — no player JS needed
     generate_session_locally: true,
     enable_safety_mode: false,
   };
@@ -1043,10 +1038,10 @@ function parseHlsBestQuality(masterPlaylist) {
   return bestBandwidth > 0 ? { bandwidth: bestBandwidth, ...bestRes } : null;
 }
 
-async function resolveYouTube(youtubeKey) {
+async function resolveYouTube(youtubeKey, db = null) {
   if (!youtubeKey) return null;
   try {
-    const yt = await getInnertube();
+    const yt = await getInnertube(db);
 
     // Try all clients, find best muxed MP4 (direct URL — compatible with Fusion/Stremio)
     // Skip HLS (.m3u8) — Fusion doesn't display HLS URLs as trailers
@@ -1278,7 +1273,8 @@ const decodeEntities = s => s.replace(/&quot;/g, '"').replace(/&amp;/g, '&').rep
 function pickBestVersion(pool, dubbedRe, originalRe) {
   const dubbed = pool.find(e => dubbedRe && dubbedRe.test(e.title));
   const nonOrig = pool.find(e => !originalRe || !originalRe.test(e.title));
-  const best = dubbed || nonOrig || (originalRe ? null : pool[0]);
+  // Prefer dubbed → non-original → any available (fallback to VO if nothing else)
+  const best = dubbed || nonOrig || pool[0];
   return { best, dubbed: !!dubbed };
 }
 
@@ -1392,8 +1388,8 @@ async function resolveMYMovies(meta) {
     );
     if (!iframeRes.ok) return null;
     const html = await iframeRes.text();
-    // Path A: Direct MP4 source (Flowplayer format)
-    const srcMatch = html.match(/src:\s*'(https?:\/\/[^']+\.mp4[^']*)'/);
+    // Path A: Direct MP4 source from <source src="..."> tag
+    const srcMatch = html.match(/src="(https?:\/\/[^"]+\.mp4[^"]*)"/);
     if (srcMatch) {
       return { url: srcMatch[1], provider: 'MYmovies', bitrate: 0, width: 0, height: 1080, localized: true };
     }
@@ -1407,35 +1403,6 @@ async function resolveMYMovies(meta) {
   return null;
 }
 
-// 13. Movieplayer.it (Italian) - ID-based page scraping
-async function resolveMovieplayer(meta) {
-  const filmId = meta?.wikidataIds?.movieplayerFilmId;
-  const seriesId = meta?.wikidataIds?.movieplayerSeriesId;
-  const id = filmId || seriesId;
-  const pathType = filmId ? 'film' : 'serie-tv';
-  if (!id) return null;
-  try {
-    const pageRes = await fetchWithTimeout(
-      `https://movieplayer.it/${pathType}/_${id}/video/`,
-      { headers: UA }
-    );
-    if (!pageRes.ok) return null;
-    const html = await pageRes.text();
-    // Extract YouTube video ID from embed
-    const ytMatch = html.match(/(?:youtube\.com\/(?:embed|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-    if (ytMatch) {
-      const result = await resolveYouTube(ytMatch[1]);
-      if (result) return { ...result, provider: 'Movieplayer', localized: true };
-    }
-    // Extract Dailymotion video ID
-    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/);
-    if (dmMatch) {
-      const result = await resolveDailymotion(dmMatch[1], 'Movieplayer');
-      if (result) return { ...result, localized: true };
-    }
-  } catch (e) { /* silent fail */ }
-  return null;
-}
 
 // ============== MAIN RESOLVER ==============
 
@@ -1447,7 +1414,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, db = null) {
-  const cacheKey = `trailer:v65:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v66:${lang}:${imdbId}`;
   if (!fresh) {
     // Check edge cache first (fastest, per-PoP)
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
@@ -1493,7 +1460,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
       try {
         const tmdbMeta = await tmdbReady.promise;
         const keys = tmdbMeta?.youtubeKeys;
-        if (keys?.length) return resolveYouTube(keys[0]);
+        if (keys?.length) return resolveYouTube(keys[0], db);
 
         // No TMDB keys — try AniList + TVDB in parallel (first one wins)
         const { wikidataIds } = await metaReady.promise;
@@ -1502,7 +1469,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
           getTvdbYouTubeKey(imdbId, lang).catch(() => null),
         ]);
         const ytKey = aniListKey || tvdbKey;
-        if (ytKey) return resolveYouTube(ytKey);
+        if (ytKey) return resolveYouTube(ytKey, db);
 
         return null;
       } catch { return null; }
@@ -1554,10 +1521,6 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
   if (localSources.includes('mymovies')) sources.push((async () => {
     const { tmdbMeta, wikidataIds } = await metaReady.promise;
     return resolveMYMovies({ ...tmdbMeta, wikidataIds });
-  })());
-  if (localSources.includes('movieplayer')) sources.push((async () => {
-    const { tmdbMeta, wikidataIds } = await metaReady.promise;
-    return resolveMovieplayer({ ...tmdbMeta, wikidataIds });
   })());
 
   // Wait for everything - allSettled so one source crash doesn't kill others
