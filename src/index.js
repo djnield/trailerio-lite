@@ -4,7 +4,7 @@
 import { Innertube, Platform } from 'youtubei.js/web';
 import { getQuickJSWASMModule } from '@cf-wasm/quickjs/workerd';
 import { BG } from 'bgutils-js';
-import vm from 'node:vm';
+// node:vm not implemented in Workers — using QuickJS WASM for BotGuard eval
 
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
@@ -593,30 +593,120 @@ async function getPoToken() {
     // 1. Fetch challenge
     const challenge = await BG.Challenge.create(bgConfig);
 
-    // 2. Execute the BotGuard interpreter in our mock environment
-    // Uses node:vm instead of new Function() (blocked by Workers without unsafe-eval)
-    const script = challenge.interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue;
-    const scriptUrl = challenge.interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
-
-    if (script) {
-      vm.runInNewContext(script, bgEnv, { timeout: 5000 });
-    } else if (scriptUrl) {
+    // 2. Execute BotGuard interpreter + snapshot in QuickJS WASM
+    // Workers blocks eval/new Function/vm.runInNewContext — QuickJS is the only option
+    let interpreterScript = challenge.interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue;
+    if (!interpreterScript) {
+      const scriptUrl = challenge.interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+      if (!scriptUrl) throw new Error('No interpreter script in challenge');
       const res = await fetch(scriptUrl);
-      const text = await res.text();
-      vm.runInNewContext(text, bgEnv, { timeout: 5000 });
-    } else {
-      throw new Error('No interpreter script in challenge');
+      interpreterScript = await res.text();
     }
 
-    // 3. Generate po_token
-    const { poToken, integrityTokenData } = await BG.PoToken.generate({
-      program: challenge.program,
-      globalName: challenge.globalName,
-      bgConfig,
+    if (!_quickjs) _quickjs = await getQuickJSWASMModule();
+    const qjsVm = _quickjs.newContext();
+
+    let botguardResponse, webPoSignalOutput;
+    try {
+      // Build a self-contained script: mock DOM + interpreter + snapshot
+      const mockDomCode = `
+        var window = globalThis; var self = globalThis; var top = globalThis; var parent = globalThis;
+        var document = {
+          createElement: function() { return { style: {}, appendChild: function(c){return c}, removeChild: function(c){return c},
+            setAttribute: function(){}, getAttribute: function(){return null}, addEventListener: function(){},
+            removeEventListener: function(){}, getElementsByTagName: function(){return []},
+            querySelector: function(){return null}, querySelectorAll: function(){return []},
+            dispatchEvent: function(){return true}, remove: function(){},
+            innerHTML: '', textContent: '', offsetWidth: 1, offsetHeight: 1, dataset: {},
+            classList: {add:function(){},remove:function(){},contains:function(){return false}},
+            getBoundingClientRect: function(){return {top:0,left:0,bottom:0,right:0,width:1,height:1}} }},
+          createElementNS: function(){return document.createElement()},
+          createTextNode: function(){return document.createElement()},
+          getElementById: function(){return null}, querySelector: function(){return null},
+          querySelectorAll: function(){return []}, getElementsByTagName: function(){return []},
+          getElementsByClassName: function(){return []},
+          documentElement: {style:{}, getAttribute:function(){return null}},
+          head: {appendChild:function(c){return c}}, body: {appendChild:function(c){return c}},
+          cookie: '', addEventListener: function(){}, removeEventListener: function(){}
+        };
+        var navigator = {
+          userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          language: 'en-US', languages: ['en-US','en'], platform: 'MacIntel',
+          webdriver: false, plugins: {length:0}, mimeTypes: {length:0},
+          hardwareConcurrency: 8, maxTouchPoints: 0, connection: {effectiveType:'4g'}
+        };
+        var performance = {now: function(){return Date.now()}, mark:function(){}, measure:function(){}, getEntriesByName:function(){return []}};
+        var location = {href:'https://www.youtube.com', origin:'https://www.youtube.com', protocol:'https:', hostname:'www.youtube.com'};
+        var screen = {width:1920, height:1080, colorDepth:24};
+        var history = {length:1};
+        var crypto = {getRandomValues: function(a){for(var i=0;i<a.length;i++) a[i]=Math.floor(Math.random()*256);return a}};
+        var requestAnimationFrame = function(cb){return setTimeout(cb,16)};
+        var cancelAnimationFrame = function(id){clearTimeout(id)};
+        var getComputedStyle = function(){return new Proxy({},{get:function(){return ''}})};
+        var matchMedia = function(){return {matches:false,addListener:function(){},removeListener:function(){}}};
+        var MutationObserver = function(){this.observe=function(){};this.disconnect=function(){}};
+        var ResizeObserver = function(){this.observe=function(){};this.disconnect=function(){}};
+        var IntersectionObserver = function(){this.observe=function(){};this.disconnect=function(){}};
+        var HTMLElement = function(){}; var HTMLDivElement = function(){}; var HTMLScriptElement = function(){};
+        var Event = function(){this.preventDefault=function(){};this.stopPropagation=function(){}};
+        var CustomEvent = function(){}; var XMLHttpRequest = function(){this.open=function(){};this.send=function(){};this.setRequestHeader=function(){};this.addEventListener=function(){}};
+      `;
+
+      const program = challenge.program;
+      const globalName = challenge.globalName;
+
+      const snapshotCode = `
+        var __webPoSignalOutput = [];
+        var __syncSnapshot = null;
+        try {
+          var __vm = globalThis['${globalName}'];
+          if (__vm && __vm.a) {
+            __syncSnapshot = __vm.a(${JSON.stringify(program)}, function(asyncFn, shutdownFn, passFn, checkFn) {}, true, undefined, function(){}, [[], []])[0];
+          }
+        } catch(e) {}
+        var __result = '';
+        if (__syncSnapshot) {
+          try { __result = __syncSnapshot([undefined, undefined, __webPoSignalOutput, undefined]) || ''; } catch(e) {}
+        }
+        JSON.stringify({r: __result, w: __webPoSignalOutput});
+      `;
+
+      const fullCode = mockDomCode + ';\n' + interpreterScript + ';\n' + snapshotCode;
+      const result = qjsVm.evalCode(fullCode);
+
+      if (result.error) {
+        const err = qjsVm.dump(result.error);
+        result.error.dispose();
+        throw new Error(`QuickJS BotGuard: ${JSON.stringify(err)}`);
+      }
+
+      const output = JSON.parse(qjsVm.dump(result.value));
+      result.value.dispose();
+      botguardResponse = output.r;
+      webPoSignalOutput = output.w || [];
+    } finally {
+      qjsVm.dispose();
+    }
+
+    if (!botguardResponse) throw new Error('BotGuard snapshot returned empty');
+
+    // 3. Exchange botguardResponse for integrity token (fetch in main context)
+    const itPayload = [bgConfig.requestKey, botguardResponse];
+    const itResponse = await fetch('https://www.youtube.com/api/jnn/v1/GenerateIT', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json+protobuf', 'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw', 'x-user-agent': 'grpc-web-javascript/0.1', 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36(KHTML, like Gecko)' },
+      body: JSON.stringify(itPayload),
     });
+    const itJson = await itResponse.json();
+    const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = itJson;
+
+    // 4. Mint po_token using WebPoMinter
+    const integrityTokenData = { integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken };
+    const webPoMinter = await BG.WebPoMinter.create(integrityTokenData, webPoSignalOutput);
+    const poToken = await webPoMinter.mintAsWebsafeString(_visitorData);
 
     _poToken = poToken;
-    _poTokenExpiry = Date.now() + ((integrityTokenData.estimatedTtlSecs || 3600) * 1000);
+    _poTokenExpiry = Date.now() + ((estimatedTtlSecs || 3600) * 1000);
     _poTokenType = 'full';
     _poTokenError = null;
 
