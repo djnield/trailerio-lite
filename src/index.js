@@ -1,6 +1,9 @@
 // Trailerio Lite - Cloudflare Workers Edition
 // Zero storage, edge-deployed trailer resolver for Fusion
 
+import { Innertube, Platform } from 'youtubei.js/web';
+import { getQuickJSWASMModule } from '@cf-wasm/quickjs/workerd';
+
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
   en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
@@ -493,107 +496,115 @@ async function resolveIMDb(imdbId) {
 
 // ============== YOUTUBE RESOLVER ==============
 
-// Itag priority: H.264 MP4 first (native iOS/tvOS), then VP9 4K (software decode in Stremio/Infuse)
-const YT_VIDEO_ITAGS = [
-  299, // 1080p60 H.264 MP4
-  298, // 720p60 H.264 MP4
-  137, // 1080p H.264 MP4
-  136, // 720p H.264 MP4
-  135, // 480p H.264 MP4
-  315, // 2160p60 VP9 WebM
-  313, // 2160p VP9 WebM
-  308, // 1440p60 VP9 WebM
-  303, // 1080p60 VP9 WebM
-  302, // 720p60 VP9 WebM
-];
-const YT_AUDIO_ITAGS = [140, 251]; // AAC MP4 (iOS native), Opus WebM
+// Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
+let _innertube = null;
+let _innertubeRefresh = 0;
+let _quickjs = null;
 
-function pickBestVideoFormat(formats) {
-  const vids = formats.filter(f => f.mimeType?.startsWith('video/') && f.url);
-  for (const itag of YT_VIDEO_ITAGS) {
-    const m = vids.find(f => f.itag === itag);
-    if (m) return m;
-  }
-  return vids.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
+async function getInnertube() {
+  const now = Date.now();
+  // Refresh session every 15 minutes (player JS changes, sessions expire)
+  if (_innertube && now - _innertubeRefresh < 15 * 60 * 1000) return _innertube;
+
+  // Initialize QuickJS WASM once
+  if (!_quickjs) _quickjs = await getQuickJSWASMModule();
+
+  // Set up custom eval shim — replaces blocked native eval()/new Function()
+  // YouTube.js uses Platform.shim.eval(data, env) for sig/nsig deciphering
+  Platform.shim.eval = async (data, env) => {
+    const vm = _quickjs.newContext();
+    try {
+      let code = '';
+      for (const [key, value] of Object.entries(env || {})) {
+        code += `var ${key} = ${JSON.stringify(value)};\n`;
+      }
+      code += data.output;
+      const result = vm.evalCode(code);
+      if (result.error) {
+        const err = vm.dump(result.error);
+        result.error.dispose();
+        throw new Error(`QuickJS: ${err}`);
+      }
+      const value = vm.dump(result.value);
+      result.value.dispose();
+      return value;
+    } finally {
+      vm.dispose();
+    }
+  };
+
+  _innertube = await Innertube.create({
+    retrieve_player: true,
+    generate_session_locally: true,
+    enable_safety_mode: false,
+  });
+  _innertubeRefresh = now;
+  return _innertube;
 }
 
-function pickBestAudioFormat(formats) {
-  const auds = formats.filter(f => f.mimeType?.startsWith('audio/') && f.url);
-  for (const itag of YT_AUDIO_ITAGS) {
-    const m = auds.find(f => f.itag === itag);
-    if (m) return m;
-  }
-  return auds.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
-}
-
-// Tier 1: ANDROID InnerTube client — returns direct URLs (no cipher needed)
 async function resolveYouTube(youtubeKey) {
   if (!youtubeKey) return null;
   try {
-    const playerRes = await fetchWithTimeout(
-      'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 13) gzip',
-          'X-YouTube-Client-Name': '3',
-          'X-YouTube-Client-Version': '19.29.37',
-        },
-        body: JSON.stringify({
-          context: {
-            client: {
-              clientName: 'ANDROID',
-              clientVersion: '19.29.37',
-              androidSdkVersion: 33,
-              hl: 'en',
-              gl: 'US',
-            },
-          },
-          videoId: youtubeKey,
-          racyCheckOk: true,
-          contentCheckOk: true,
-        }),
-      },
-      8000
-    );
-    const data = await playerRes.json();
-    if (data.playabilityStatus?.status !== 'OK') return null;
+    const yt = await getInnertube();
+    const info = await yt.getBasicInfo(youtubeKey);
 
-    // Try muxed formats first (video+audio in one stream, simpler for players)
-    const muxed = (data.streamingData?.formats || []).filter(f => f.url);
+    if (info.playability_status?.status !== 'OK') return null;
+
+    const streamingData = info.streaming_data;
+    if (!streamingData) return null;
+
+    // Try muxed formats first (video+audio combined, simpler for players)
+    const muxedRaw = streamingData.formats || [];
+    const muxed = [];
+    for (const f of muxedRaw) {
+      try {
+        const url = f.decipher(yt.session.player);
+        if (url) muxed.push({ ...f, url });
+      } catch { /* skip failed decipher */ }
+    }
+    muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
+
     if (muxed.length > 0) {
-      // Prefer highest quality muxed (typically 720p H.264 max)
-      muxed.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
       const best = muxed[0];
-      const qualityLabel = best.qualityLabel || `${best.height || 360}p`;
       return {
         url: best.url,
-        provider: `YouTube ${qualityLabel}`,
+        provider: `YouTube ${best.quality_label || '360p'}`,
         bitrate: Math.round((best.bitrate || 0) / 1000),
         width: best.width || 0,
         height: best.height || 0
       };
     }
 
-    // Fallback: adaptive formats (video-only — audio separate)
-    const formats = data.streamingData?.adaptiveFormats || [];
-    const video = pickBestVideoFormat(formats);
-    if (!video?.url) return null;
+    // Fallback: adaptive formats (video-only, prefer H.264 for iOS/tvOS)
+    const adaptiveRaw = (streamingData.adaptive_formats || [])
+      .filter(f => f.mime_type?.startsWith('video/'));
+    const adaptive = [];
+    for (const f of adaptiveRaw) {
+      try {
+        const url = f.decipher(yt.session.player);
+        if (url) adaptive.push({ ...f, url });
+      } catch { /* skip */ }
+    }
+    adaptive.sort((a, b) => {
+      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
+      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
+      if (aH264 !== bH264) return bH264 - aH264;
+      return (b.height || 0) - (a.height || 0);
+    });
 
-    const height = video.height || 0;
-    const width = video.width || 0;
-    const qualityLabel = video.qualityLabel || (height >= 2160 ? '4K' : height >= 1080 ? '1080p' : `${height}p`);
-    const codec = video.mimeType?.includes('avc1') ? 'H.264' : video.mimeType?.includes('vp9') ? 'VP9' : '';
-    const label = `YouTube ${qualityLabel}${codec ? ' ' + codec : ''}`;
+    if (adaptive.length > 0) {
+      const best = adaptive[0];
+      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('vp9') ? 'VP9' : '';
+      return {
+        url: best.url,
+        provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
+        bitrate: Math.round((best.bitrate || 0) / 1000),
+        width: best.width || 0,
+        height: best.height || 0
+      };
+    }
 
-    return {
-      url: video.url,
-      provider: label,
-      bitrate: Math.round((video.bitrate || 0) / 1000),
-      width,
-      height
-    };
+    return null;
   } catch (e) {
     return null;
   }

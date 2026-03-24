@@ -11,5 +11,9 @@
   },
   "devDependencies": {
     "wrangler": "^3.0.0"
+  },
+  "dependencies": {
+    "@cf-wasm/quickjs": "^0.2.4",
+    "youtubei.js": "^17.0.1"
   }
 }
