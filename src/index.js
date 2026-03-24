@@ -1494,14 +1494,18 @@ export default {
       try {
         const yt = await getInnertube();
         let info = null;
+        let lastErr = '';
         for (const client of YOUTUBE_CLIENTS) {
           try {
             info = await yt.getBasicInfo(videoId, { client });
             if (info?.playability_status?.status === 'OK' && info?.streaming_data) break;
-          } catch { /* next */ }
+            info = null; // reset if not OK
+          } catch (e) { lastErr = `${client}: ${e.message}`; }
         }
         if (!info?.streaming_data) {
-          return new Response(JSON.stringify({ error: 'Video unavailable' }), { status: 404, headers: corsHeaders });
+          const status = info?.playability_status?.status || 'no-info';
+          const reason = info?.playability_status?.reason || lastErr || 'no streaming data';
+          return new Response(JSON.stringify({ error: `Video unavailable: ${status} - ${reason}`, poToken: _poTokenType }), { status: 404, headers: corsHeaders });
         }
 
         // Find the requested format by itag
