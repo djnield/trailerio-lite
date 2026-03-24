@@ -499,6 +499,13 @@ async function resolveIMDb(imdbId) {
 // Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
 // TV_EMBEDDED and ANDROID clients are less likely to be blocked from datacenter IPs
 const YOUTUBE_CLIENTS = ['TV_EMBEDDED', 'ANDROID', 'WEB'];
+
+// Get URL from format — use direct URL if available, decipher only when needed
+async function getFormatUrl(f, player) {
+  if (f.url) return f.url;
+  return String(await f.decipher(player));
+}
+
 let _innertube = null;
 let _innertubeRefresh = 0;
 let _quickjs = null;
@@ -528,7 +535,7 @@ async function getInnertube() {
       if (result.error) {
         const err = vm.dump(result.error);
         result.error.dispose();
-        throw new Error(`QuickJS: ${err}`);
+        throw new Error(`QuickJS: ${JSON.stringify(err)}`);
       }
       const value = vm.dump(result.value);
       result.value.dispose();
@@ -571,7 +578,7 @@ async function resolveYouTube(youtubeKey) {
     const muxed = [];
     for (const f of muxedRaw) {
       try {
-        const url = String(await f.decipher(yt.session.player));
+        const url = await getFormatUrl(f, yt.session.player);
         if (url) muxed.push({ ...f, url });
       } catch { /* skip failed decipher */ }
     }
@@ -594,7 +601,7 @@ async function resolveYouTube(youtubeKey) {
     const adaptive = [];
     for (const f of adaptiveRaw) {
       try {
-        const url = String(await f.decipher(yt.session.player));
+        const url = await getFormatUrl(f, yt.session.player);
         if (url) adaptive.push({ ...f, url });
       } catch { /* skip */ }
     }
@@ -652,7 +659,7 @@ async function resolveYouTubeDebug(videoId) {
         if (result.error) {
           const err = vm.dump(result.error);
           result.error.dispose();
-          throw new Error(`QuickJS: ${err}`);
+          throw new Error(`QuickJS: ${JSON.stringify(err)}`);
         }
         const value = vm.dump(result.value);
         result.value.dispose();
@@ -699,7 +706,7 @@ async function resolveYouTubeDebug(videoId) {
   if (info.streaming_data?.formats?.length > 0) {
     try {
       const f = info.streaming_data.formats[0];
-      const url = String(await f.decipher(yt.session.player));
+      const url = await getFormatUrl(f, yt.session.player);
       stages.decipherMuxed = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
     } catch (e) {
       stages.decipherMuxed = `FAILED: ${e.message}`;
@@ -709,7 +716,7 @@ async function resolveYouTubeDebug(videoId) {
   if (info.streaming_data?.adaptive_formats?.length > 0) {
     try {
       const f = info.streaming_data.adaptive_formats[0];
-      const url = String(await f.decipher(yt.session.player));
+      const url = await getFormatUrl(f, yt.session.player);
       stages.decipherAdaptive = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
     } catch (e) {
       stages.decipherAdaptive = `FAILED: ${e.message}`;
