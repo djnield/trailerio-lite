@@ -755,13 +755,14 @@ async function getPoToken() {
             __syncSnapshot = __vm.a(${JSON.stringify(program)}, function(asyncFn, shutdownFn, passFn, checkFn) {}, true, undefined, function(){}, [[], []])[0];
           }
         } catch(e) {}
-        var __result = '';
+        var __bgResponse = '';
         if (__syncSnapshot) {
-          try { __result = __syncSnapshot([undefined, undefined, __webPoSignalOutput, undefined]) || ''; } catch(e) {}
+          try { __bgResponse = __syncSnapshot([undefined, undefined, __webPoSignalOutput, undefined]) || ''; } catch(e) {}
         }
-        JSON.stringify({r: __result, w: __webPoSignalOutput});
+        JSON.stringify({r: __bgResponse, hasMinter: typeof __webPoSignalOutput[0] === 'function'});
       `;
 
+      // Step 1: Run BotGuard interpreter + snapshot (keep context alive for minting)
       const fullCode = mockDomCode + ';\n' + interpreterScript + ';\n' + snapshotCode;
       const result = qjsVm.evalCode(fullCode);
 
@@ -774,43 +775,90 @@ async function getPoToken() {
       const output = JSON.parse(qjsVm.dump(result.value));
       result.value.dispose();
       botguardResponse = output.r;
-      webPoSignalOutput = output.w || [];
-    } finally {
-      qjsVm.dispose();
-    }
+      const hasMinter = output.hasMinter;
 
-    if (!botguardResponse) throw new Error('BotGuard snapshot returned empty');
+      if (!botguardResponse) throw new Error('BotGuard snapshot returned empty');
 
-    // 3. Exchange botguardResponse for integrity token (fetch in main context)
-    const itPayload = [bgConfig.requestKey, botguardResponse];
-    const itResponse = await fetch('https://www.youtube.com/api/jnn/v1/GenerateIT', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json+protobuf', 'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw', 'x-user-agent': 'grpc-web-javascript/0.1', 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36(KHTML, like Gecko)' },
-      body: JSON.stringify(itPayload),
-    });
-    const itJson = await itResponse.json();
-    const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = itJson;
+      // Step 2: Exchange botguardResponse for integrity token (fetch in main context)
+      const itPayload = [bgConfig.requestKey, botguardResponse];
+      const itResponse = await fetch('https://www.youtube.com/api/jnn/v1/GenerateIT', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json+protobuf', 'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw', 'x-user-agent': 'grpc-web-javascript/0.1', 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36(KHTML, like Gecko)' },
+        body: JSON.stringify(itPayload),
+      });
+      const itJson = await itResponse.json();
+      const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = itJson;
 
-    // 4. Try minting proper po_token, fall back to websafeFallbackToken
-    let poToken;
-    const integrityTokenData = { integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken };
-    try {
-      if (webPoSignalOutput?.[0] && typeof webPoSignalOutput[0] === 'function') {
-        const webPoMinter = await BG.WebPoMinter.create(integrityTokenData, webPoSignalOutput);
-        poToken = await webPoMinter.mintAsWebsafeString(_visitorData);
-        _poTokenType = 'minted';
+      // Step 3: Mint po_token INSIDE the same QuickJS context (minter function lives there)
+      let poToken;
+      if (hasMinter && integrityToken) {
+        // Decode integrityToken (base64url) to byte array in main context
+        const b64 = integrityToken.replace(/-/g, '+').replace(/_/g, '/').replace(/\./g, '=');
+        const raw = atob(b64);
+        const tokenBytes = [];
+        for (let i = 0; i < raw.length; i++) tokenBytes.push(raw.charCodeAt(i));
+
+        // Encode visitorData to UTF-8 bytes
+        const idBytes = [];
+        for (let i = 0; i < _visitorData.length; i++) idBytes.push(_visitorData.charCodeAt(i));
+
+        // Run minting inside QuickJS — getMinter + mintCallback stay in the VM
+        const mintCode = `
+          (function() {
+            var getMinter = __webPoSignalOutput[0];
+            if (!getMinter) return JSON.stringify({err: 'no_minter'});
+            try {
+              var tokenBytes = new Uint8Array(${JSON.stringify(tokenBytes)});
+              var mintCb = getMinter(tokenBytes);
+              if (typeof mintCb === 'object' && mintCb && typeof mintCb.then === 'function') {
+                return JSON.stringify({err: 'async_minter'});
+              }
+              if (typeof mintCb !== 'function') return JSON.stringify({err: 'mintcb_type_' + typeof mintCb});
+              var idBytes = new Uint8Array(${JSON.stringify(idBytes)});
+              var result = mintCb(idBytes);
+              if (!result) return JSON.stringify({err: 'mint_null'});
+              // Convert Uint8Array to regular array for JSON
+              var arr = [];
+              for (var i = 0; i < result.length; i++) arr.push(result[i]);
+              return JSON.stringify({ok: arr});
+            } catch(e) {
+              return JSON.stringify({err: 'mint_error: ' + (e.message || e)});
+            }
+          })();
+        `;
+
+        const mintResult = qjsVm.evalCode(mintCode);
+        if (!mintResult.error) {
+          const mintOutput = JSON.parse(qjsVm.dump(mintResult.value));
+          mintResult.value.dispose();
+
+          if (mintOutput.ok) {
+            // Encode minted bytes to base64url
+            const bytes = String.fromCharCode(...mintOutput.ok);
+            poToken = btoa(bytes).replace(/\+/g, '-').replace(/\//g, '_');
+            _poTokenType = 'minted';
+          } else {
+            _poTokenError = mintOutput.err;
+            poToken = websafeFallbackToken || integrityToken;
+            _poTokenType = 'websafe-fallback';
+          }
+        } else {
+          const err = qjsVm.dump(mintResult.error);
+          mintResult.error.dispose();
+          _poTokenError = `mint_eval: ${JSON.stringify(err)}`;
+          poToken = websafeFallbackToken || integrityToken;
+          _poTokenType = 'websafe-fallback';
+        }
       } else {
         poToken = websafeFallbackToken || integrityToken;
-        _poTokenType = 'websafe-fallback';
+        _poTokenType = hasMinter ? 'websafe-fallback' : 'no-minter-fallback';
       }
-    } catch {
-      poToken = websafeFallbackToken || integrityToken;
-      _poTokenType = 'websafe-fallback';
-    }
+
+    qjsVm.dispose(); // Done with BotGuard context
 
     _poToken = poToken;
     _poTokenExpiry = Date.now() + ((estimatedTtlSecs || 3600) * 1000);
-    _poTokenError = null;
+    if (_poTokenType === 'minted') _poTokenError = null;
 
     return { poToken: _poToken, visitorData: _visitorData };
   } catch (e) {
@@ -1285,7 +1333,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v55:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v56:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
