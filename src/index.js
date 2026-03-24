@@ -1,10 +1,7 @@
 // Trailerio Lite - Cloudflare Workers Edition
 // Zero storage, edge-deployed trailer resolver for Fusion
 
-import { Innertube, Platform } from 'youtubei.js/web';
-import { getQuickJSWASMModule } from '@cf-wasm/quickjs/workerd';
-import { BG } from 'bgutils-js';
-// node:vm not implemented in Workers — using QuickJS WASM for BotGuard eval
+// No external YouTube dependencies — direct Innertube API calls only
 
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
@@ -587,583 +584,249 @@ async function getTvdbYouTubeKey(imdbId, lang = 'en') {
   return null;
 }
 
-// ============== PO_TOKEN GENERATION (BotGuard attestation) ==============
-
-// Minimal DOM mock for BotGuard — it probes these but doesn't need real rendering
-function createBotGuardEnv() {
-  const el = () => ({
-    style: {}, dataset: {}, classList: { add() {}, remove() {}, contains() { return false; } },
-    appendChild(c) { return c; }, removeChild(c) { return c; }, remove() {},
-    setAttribute() {}, getAttribute() { return null; }, getElementsByTagName() { return []; },
-    querySelector() { return null; }, querySelectorAll() { return []; },
-    addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-    innerHTML: '', textContent: '', innerText: '', offsetWidth: 1, offsetHeight: 1,
-    getBoundingClientRect() { return { top: 0, left: 0, bottom: 0, right: 0, width: 1, height: 1 }; },
-  });
-
-  const globalObj = {
-    document: {
-      createElement: () => el(), createElementNS: () => el(), createTextNode: () => el(),
-      getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
-      getElementsByTagName: () => [], getElementsByClassName: () => [],
-      documentElement: { style: {}, getAttribute() { return null; } },
-      head: el(), body: el(), cookie: '',
-      addEventListener() {}, removeEventListener() {},
-    },
-    navigator: {
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      language: 'en-US', languages: ['en-US', 'en'], platform: 'MacIntel',
-      webdriver: false, plugins: { length: 0 }, mimeTypes: { length: 0 },
-      hardwareConcurrency: 8, maxTouchPoints: 0,
-      connection: { effectiveType: '4g' },
-    },
-    performance: { now: () => Date.now(), mark() {}, measure() {}, getEntriesByName() { return []; } },
-    location: { href: 'https://www.youtube.com', origin: 'https://www.youtube.com', protocol: 'https:', hostname: 'www.youtube.com' },
-    screen: { width: 1920, height: 1080, colorDepth: 24 },
-    history: { length: 1 },
-    console, setTimeout, clearTimeout, setInterval, clearInterval,
-    atob, btoa, fetch: (input, init) => fetch(input, init),
-    TextEncoder, TextDecoder, URL, URLSearchParams,
-    Uint8Array, Int32Array, ArrayBuffer, DataView,
-    Object, Array, String, Number, Boolean, RegExp, Date, Math, JSON, Promise, Symbol, Map, Set, WeakMap, WeakSet, Proxy, Reflect,
-    Error, TypeError, RangeError, SyntaxError,
-    parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
-    crypto: { getRandomValues: (arr) => { for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256); return arr; } },
-    requestAnimationFrame: (cb) => setTimeout(cb, 16),
-    cancelAnimationFrame: (id) => clearTimeout(id),
-    getComputedStyle: () => new Proxy({}, { get: () => '' }),
-    matchMedia: () => ({ matches: false, addListener() {}, removeListener() {} }),
-    MutationObserver: class { observe() {} disconnect() {} },
-    ResizeObserver: class { observe() {} disconnect() {} },
-    IntersectionObserver: class { observe() {} disconnect() {} },
-    HTMLElement: class {}, HTMLDivElement: class {}, HTMLScriptElement: class {},
-    Event: class { constructor() {} preventDefault() {} stopPropagation() {} },
-    CustomEvent: class { constructor() {} },
-    XMLHttpRequest: class { open() {} send() {} setRequestHeader() {} addEventListener() {} },
-  };
-
-  globalObj.window = globalObj;
-  globalObj.self = globalObj;
-  globalObj.top = globalObj;
-  globalObj.parent = globalObj;
-  globalObj.globalThis = globalObj;
-  return globalObj;
-}
-
-let _poToken = null;
-let _poTokenExpiry = 0;
-let _poTokenType = 'none'; // 'full', 'cold-start', or 'none'
-let _poTokenError = null;
-let _visitorData = null;
-
-async function getPoToken() {
-  // Return cached token if still valid (with 5 min buffer)
-  if (_poToken && Date.now() < _poTokenExpiry - 300000) {
-    return { poToken: _poToken, visitorData: _visitorData };
-  }
-
-  try {
-    // Generate visitor_data if we don't have one
-    if (!_visitorData) {
-      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-      let id = '';
-      for (let i = 0; i < 11; i++) id += chars[Math.floor(Math.random() * chars.length)];
-      _visitorData = id;
-    }
-
-    const bgEnv = createBotGuardEnv();
-
-    const bgConfig = {
-      fetch: (input, init) => fetch(input, init),
-      requestKey: 'O43z0dpjhgX20SCx4KAo',
-      globalObj: bgEnv,
-      identifier: _visitorData,
-      useYouTubeAPI: true,
-    };
-
-    // 1. Fetch challenge
-    const challenge = await BG.Challenge.create(bgConfig);
-
-    // 2. Execute BotGuard interpreter + snapshot in QuickJS WASM
-    // Workers blocks eval/new Function/vm.runInNewContext — QuickJS is the only option
-    let interpreterScript = challenge.interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue;
-    if (!interpreterScript) {
-      const scriptUrl = challenge.interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
-      if (!scriptUrl) throw new Error('No interpreter script in challenge');
-      const res = await fetch(scriptUrl);
-      interpreterScript = await res.text();
-    }
-
-    if (!_quickjs) _quickjs = await getQuickJSWASMModule();
-    const qjsVm = _quickjs.newContext();
-
-    let botguardResponse, poToken, estimatedTtlSecs;
-    try {
-      // Build a self-contained script: mock DOM + interpreter + snapshot
-      const mockDomCode = `
-        var window = globalThis; var self = globalThis; var top = globalThis; var parent = globalThis;
-        var document = {
-          createElement: function() { return { style: {}, appendChild: function(c){return c}, removeChild: function(c){return c},
-            setAttribute: function(){}, getAttribute: function(){return null}, addEventListener: function(){},
-            removeEventListener: function(){}, getElementsByTagName: function(){return []},
-            querySelector: function(){return null}, querySelectorAll: function(){return []},
-            dispatchEvent: function(){return true}, remove: function(){},
-            innerHTML: '', textContent: '', offsetWidth: 1, offsetHeight: 1, dataset: {},
-            classList: {add:function(){},remove:function(){},contains:function(){return false}},
-            getBoundingClientRect: function(){return {top:0,left:0,bottom:0,right:0,width:1,height:1}} }},
-          createElementNS: function(){return document.createElement()},
-          createTextNode: function(){return document.createElement()},
-          getElementById: function(){return null}, querySelector: function(){return null},
-          querySelectorAll: function(){return []}, getElementsByTagName: function(){return []},
-          getElementsByClassName: function(){return []},
-          documentElement: {style:{}, getAttribute:function(){return null}},
-          head: {appendChild:function(c){return c}}, body: {appendChild:function(c){return c}},
-          cookie: '', addEventListener: function(){}, removeEventListener: function(){}
-        };
-        var navigator = {
-          userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          language: 'en-US', languages: ['en-US','en'], platform: 'MacIntel',
-          webdriver: false, plugins: {length:0}, mimeTypes: {length:0},
-          hardwareConcurrency: 8, maxTouchPoints: 0, connection: {effectiveType:'4g'}
-        };
-        var performance = {now: function(){return Date.now()}, mark:function(){}, measure:function(){}, getEntriesByName:function(){return []}};
-        var location = {href:'https://www.youtube.com', origin:'https://www.youtube.com', protocol:'https:', hostname:'www.youtube.com'};
-        var screen = {width:1920, height:1080, colorDepth:24};
-        var history = {length:1};
-        var crypto = {getRandomValues: function(a){for(var i=0;i<a.length;i++) a[i]=Math.floor(Math.random()*256);return a}};
-        var requestAnimationFrame = function(cb){return setTimeout(cb,16)};
-        var cancelAnimationFrame = function(id){clearTimeout(id)};
-        var getComputedStyle = function(){return new Proxy({},{get:function(){return ''}})};
-        var matchMedia = function(){return {matches:false,addListener:function(){},removeListener:function(){}}};
-        var MutationObserver = function(){this.observe=function(){};this.disconnect=function(){}};
-        var ResizeObserver = function(){this.observe=function(){};this.disconnect=function(){}};
-        var IntersectionObserver = function(){this.observe=function(){};this.disconnect=function(){}};
-        var HTMLElement = function(){}; var HTMLDivElement = function(){}; var HTMLScriptElement = function(){};
-        var Event = function(){this.preventDefault=function(){};this.stopPropagation=function(){}};
-        var CustomEvent = function(){}; var XMLHttpRequest = function(){this.open=function(){};this.send=function(){};this.setRequestHeader=function(){};this.addEventListener=function(){}};
-      `;
-
-      const program = challenge.program;
-      const globalName = challenge.globalName;
-
-      const snapshotCode = `
-        var __webPoSignalOutput = [];
-        var __syncSnapshot = null;
-        try {
-          var __vm = globalThis['${globalName}'];
-          if (__vm && __vm.a) {
-            __syncSnapshot = __vm.a(${JSON.stringify(program)}, function(asyncFn, shutdownFn, passFn, checkFn) {}, true, undefined, function(){}, [[], []])[0];
-          }
-        } catch(e) {}
-        var __bgResponse = '';
-        if (__syncSnapshot) {
-          try { __bgResponse = __syncSnapshot([undefined, undefined, __webPoSignalOutput, undefined]) || ''; } catch(e) {}
-        }
-        JSON.stringify({r: __bgResponse, hasMinter: typeof __webPoSignalOutput[0] === 'function'});
-      `;
-
-      // Step 1: Run BotGuard interpreter + snapshot (keep context alive for minting)
-      const fullCode = mockDomCode + ';\n' + interpreterScript + ';\n' + snapshotCode;
-      const result = qjsVm.evalCode(fullCode);
-
-      if (result.error) {
-        const err = qjsVm.dump(result.error);
-        result.error.dispose();
-        throw new Error(`QuickJS BotGuard: ${JSON.stringify(err)}`);
-      }
-
-      const output = JSON.parse(qjsVm.dump(result.value));
-      result.value.dispose();
-      botguardResponse = output.r;
-      const hasMinter = output.hasMinter;
-
-      if (!botguardResponse) throw new Error('BotGuard snapshot returned empty');
-
-      // Step 2: Exchange botguardResponse for integrity token (fetch in main context)
-      const itPayload = [bgConfig.requestKey, botguardResponse];
-      const itResponse = await fetch('https://www.youtube.com/api/jnn/v1/GenerateIT', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json+protobuf', 'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw', 'x-user-agent': 'grpc-web-javascript/0.1', 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36(KHTML, like Gecko)' },
-        body: JSON.stringify(itPayload),
-      });
-      const itJson = await itResponse.json();
-      const [integrityToken, estTtl, mintRefreshThreshold, websafeFallbackToken] = itJson;
-      estimatedTtlSecs = estTtl;
-
-      // Step 3: Mint po_token INSIDE the same QuickJS context (minter function lives there)
-      if (hasMinter && integrityToken) {
-        // Decode integrityToken (base64url) to byte array in main context
-        const b64 = integrityToken.replace(/-/g, '+').replace(/_/g, '/').replace(/\./g, '=');
-        const raw = atob(b64);
-        const tokenBytes = [];
-        for (let i = 0; i < raw.length; i++) tokenBytes.push(raw.charCodeAt(i));
-
-        // Encode visitorData to UTF-8 bytes
-        const idBytes = [];
-        for (let i = 0; i < _visitorData.length; i++) idBytes.push(_visitorData.charCodeAt(i));
-
-        // Run minting inside QuickJS — getMinter + mintCallback stay in the VM
-        const mintCode = `
-          (function() {
-            var getMinter = __webPoSignalOutput[0];
-            if (!getMinter) return JSON.stringify({err: 'no_minter'});
-            try {
-              var tokenBytes = new Uint8Array(${JSON.stringify(tokenBytes)});
-              var mintCb = getMinter(tokenBytes);
-              if (typeof mintCb === 'object' && mintCb && typeof mintCb.then === 'function') {
-                return JSON.stringify({err: 'async_minter'});
-              }
-              if (typeof mintCb !== 'function') return JSON.stringify({err: 'mintcb_type_' + typeof mintCb});
-              var idBytes = new Uint8Array(${JSON.stringify(idBytes)});
-              var result = mintCb(idBytes);
-              if (!result) return JSON.stringify({err: 'mint_null'});
-              // Convert Uint8Array to regular array for JSON
-              var arr = [];
-              for (var i = 0; i < result.length; i++) arr.push(result[i]);
-              return JSON.stringify({ok: arr});
-            } catch(e) {
-              return JSON.stringify({err: 'mint_error: ' + (e.message || e)});
-            }
-          })();
-        `;
-
-        const mintResult = qjsVm.evalCode(mintCode);
-        if (!mintResult.error) {
-          const mintOutput = JSON.parse(qjsVm.dump(mintResult.value));
-          mintResult.value.dispose();
-
-          if (mintOutput.ok) {
-            // Encode minted bytes to base64url
-            const bytes = String.fromCharCode(...mintOutput.ok);
-            poToken = btoa(bytes).replace(/\+/g, '-').replace(/\//g, '_');
-            _poTokenType = 'minted';
-          } else {
-            _poTokenError = mintOutput.err;
-            poToken = websafeFallbackToken || integrityToken;
-            _poTokenType = 'websafe-fallback';
-          }
-        } else {
-          const err = qjsVm.dump(mintResult.error);
-          mintResult.error.dispose();
-          _poTokenError = `mint_eval: ${JSON.stringify(err)}`;
-          poToken = websafeFallbackToken || integrityToken;
-          _poTokenType = 'websafe-fallback';
-        }
-      } else {
-        poToken = websafeFallbackToken || integrityToken;
-        _poTokenType = hasMinter ? 'websafe-fallback' : 'no-minter-fallback';
-      }
-
-    } finally {
-      qjsVm.dispose();
-    }
-
-    _poToken = poToken;
-    _poTokenExpiry = Date.now() + ((estimatedTtlSecs || 3600) * 1000);
-    if (_poTokenType === 'minted') _poTokenError = null;
-
-    return { poToken: _poToken, visitorData: _visitorData };
-  } catch (e) {
-    _poTokenError = e.message || String(e);
-    // Fallback: cold-start token (works during SPS=2 grace period)
-    if (_visitorData) {
-      const coldToken = BG.PoToken.generateColdStartToken(_visitorData);
-      _poToken = coldToken;
-      _poTokenExpiry = Date.now() + 600000; // 10 min for cold-start
-      _poTokenType = 'cold-start';
-      return { poToken: coldToken, visitorData: _visitorData };
-    }
-    return { poToken: null, visitorData: null };
-  }
-}
-
 // ============== YOUTUBE RESOLVER ==============
+// Direct Innertube API — zero external dependencies, muxed formats only (video+audio)
+// Mobile clients return pre-signed URLs (no cipher deciphering needed)
 
-// Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
-// IOS returns pre-signed adaptive URLs (1080p H.264), least blocked from datacenter IPs
-// ANDROID has pre-signed URLs too; WEB has most formats but gets 403'd more often
-const YOUTUBE_CLIENTS = ['IOS', 'ANDROID', 'WEB'];
+const YT_CLIENTS = [
+  {
+    // IOS first — returns hlsManifestUrl (combined video+audio up to 1080p+)
+    label: 'IOS',
+    key: 'AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc',
+    context: {
+      client: {
+        clientName: 'IOS',
+        clientVersion: '19.45.4',
+        deviceMake: 'Apple',
+        deviceModel: 'iPhone16,2',
+        userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+        hl: 'en',
+        gl: 'US',
+      }
+    },
+    ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+  },
+  {
+    label: 'ANDROID',
+    key: 'AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w',
+    context: {
+      client: {
+        clientName: 'ANDROID',
+        clientVersion: '19.44.38',
+        androidSdkVersion: 30,
+        userAgent: 'com.google.android.youtube/19.44.38 (Linux; U; Android 11) gzip',
+        hl: 'en',
+        gl: 'US',
+      }
+    },
+    ua: 'com.google.android.youtube/19.44.38 (Linux; U; Android 11) gzip',
+  },
+  {
+    label: 'TV_EMBEDDED',
+    key: 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+    context: {
+      client: {
+        clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+        clientVersion: '2.0',
+        hl: 'en',
+        gl: 'US',
+      },
+      thirdParty: {
+        embedUrl: 'https://www.youtube.com',
+      }
+    },
+    ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) 85.0.4183.93/6.5 TV Safari/537.36',
+  },
+];
 
-// Get URL from format — use direct URL if available, decipher only when needed
-async function getFormatUrl(f, player) {
-  const raw = f.url || String(await f.decipher(player));
-  return raw || null;
+// Raw Innertube player API request — no library, no cipher, no tokens
+async function ytPlayerRequest(videoId, client) {
+  const res = await fetchWithTimeout(
+    `https://www.youtube.com/youtubei/v1/player?key=${client.key}&prettyPrint=false`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': client.ua,
+        'X-Goog-Api-Format-Version': '2',
+      },
+      body: JSON.stringify({
+        videoId,
+        context: client.context,
+        contentCheckOk: true,
+        racyCheckOk: true,
+      }),
+    },
+    8000
+  );
+  return res.json();
 }
 
-// YouTube URLs work from residential/mobile IPs — no proxy needed
+// Pick the best muxed format (video+audio combined) — the only kind Fusion can play
+function pickBestMuxed(streamingData) {
+  const formats = (streamingData.formats || [])
+    .filter(f => f.url && f.mimeType?.includes('video/'))
+    .sort((a, b) => (b.height || 0) - (a.height || 0));
+  return formats[0] || null;
+}
 
-let _innertube = null;
-let _innertubeRefresh = 0;
-let _quickjs = null;
+// Parse HLS master playlist to find best quality stream
+function parseHlsBestQuality(masterPlaylist) {
+  const lines = masterPlaylist.split('\n');
+  let bestBandwidth = 0;
+  let bestUrl = null;
+  let bestRes = null;
 
-async function getInnertube() {
-  const now = Date.now();
-  // Refresh session every 15 minutes (player JS changes, sessions expire)
-  if (_innertube && now - _innertubeRefresh < 15 * 60 * 1000) return _innertube;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF:')) continue;
 
-  // Initialize QuickJS WASM once
-  if (!_quickjs) _quickjs = await getQuickJSWASMModule();
+    const bwMatch = line.match(/BANDWIDTH=(\d+)/);
+    const resMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
+    const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
 
-  // Fix Cloudflare Workers "Illegal invocation" — wrap fetch to preserve `this` binding
-  Platform.shim.fetch = (input, init) => fetch(input, init);
+    // Get the URL on the next line
+    const urlLine = lines[i + 1]?.trim();
+    if (!urlLine || urlLine.startsWith('#')) continue;
 
-  // Set up custom eval shim — replaces blocked native eval()/new Function()
-  // YouTube.js uses Platform.shim.eval(data, env) for sig/nsig deciphering
-  Platform.shim.eval = async (data, env) => {
-    const vm = _quickjs.newContext();
-    try {
-      let code = '';
-      for (const [key, value] of Object.entries(env || {})) {
-        code += `var ${key} = ${JSON.stringify(value)};\n`;
-      }
-      code += data.output;
-      const result = vm.evalCode(code);
-      if (result.error) {
-        const err = vm.dump(result.error);
-        result.error.dispose();
-        throw new Error(`QuickJS: ${JSON.stringify(err)}`);
-      }
-      const value = vm.dump(result.value);
-      result.value.dispose();
-      return value;
-    } finally {
-      vm.dispose();
+    if (bandwidth > bestBandwidth) {
+      bestBandwidth = bandwidth;
+      bestUrl = urlLine;
+      bestRes = resMatch ? { width: parseInt(resMatch[1]), height: parseInt(resMatch[2]) } : null;
     }
-  };
+  }
 
-  // Get po_token for bot attestation (reduces 403s from datacenter IPs)
-  const { poToken, visitorData } = await getPoToken();
-
-  const createOpts = {
-    retrieve_player: true,
-    generate_session_locally: true,
-    enable_safety_mode: false,
-  };
-  if (poToken) createOpts.po_token = poToken;
-  if (visitorData) createOpts.visitor_data = visitorData;
-
-  _innertube = await Innertube.create(createOpts);
-  _innertubeRefresh = now;
-  return _innertube;
+  return bestUrl ? { url: bestUrl, bandwidth: bestBandwidth, ...bestRes } : null;
 }
 
 async function resolveYouTube(youtubeKey) {
   if (!youtubeKey) return null;
-  try {
-    const yt = await getInnertube();
 
-    // Try multiple client types — datacenter IPs get blocked on WEB but not TV/mobile
-    let info = null;
-    for (const client of YOUTUBE_CLIENTS) {
-      try {
-        info = await yt.getBasicInfo(youtubeKey, { client });
-        if (info.playability_status?.status === 'OK' && info.streaming_data) break;
-      } catch { /* try next client */ }
+  for (const client of YT_CLIENTS) {
+    try {
+      const data = await ytPlayerRequest(youtubeKey, client);
+
+      if (data.playabilityStatus?.status !== 'OK') continue;
+      const sd = data.streamingData;
+      if (!sd) continue;
+
+      // Priority 1: HLS manifest — combined video+audio, up to 1080p+
+      if (sd.hlsManifestUrl) {
+        try {
+          const hlsRes = await fetchWithTimeout(sd.hlsManifestUrl, {}, 5000);
+          if (hlsRes.ok) {
+            const masterText = await hlsRes.text();
+            const best = parseHlsBestQuality(masterText);
+            if (best) {
+              const height = best.height || 1080;
+              return {
+                url: sd.hlsManifestUrl, // return master playlist — player picks quality
+                provider: `YouTube ${height}p`,
+                bitrate: Math.round((best.bandwidth || 0) / 1000),
+                width: best.width || 0,
+                height,
+              };
+            }
+          }
+        } catch { /* HLS fetch failed, try muxed */ }
+      }
+
+      // Priority 2: Muxed MP4 — video+audio combined, 720p max
+      const best = pickBestMuxed(sd);
+      if (best) {
+        const label = best.qualityLabel || `${best.height || 360}p`;
+        return {
+          url: best.url,
+          provider: `YouTube ${label}`,
+          bitrate: Math.round((best.bitrate || 0) / 1000),
+          width: best.width || 0,
+          height: best.height || 0,
+        };
+      }
+      // This client had no usable formats — try next
+    } catch {
+      continue;
     }
-
-    if (!info || info.playability_status?.status !== 'OK') return null;
-
-    const streamingData = info.streaming_data;
-    if (!streamingData) return null;
-
-    // ADAPTIVE: MP4 only (AVFoundation can't play WebM/VP9)
-    // H.264 first (1080p, plays everywhere), then by resolution
-    const adaptiveRaw = (streamingData.adaptive_formats || [])
-      .filter(f => f.mime_type?.startsWith('video/mp4'));
-    const adaptive = [];
-    for (const f of adaptiveRaw) {
-      try {
-        const url = await getFormatUrl(f, yt.session.player);
-        if (url) adaptive.push({ ...f, url });
-      } catch { /* skip */ }
-    }
-    adaptive.sort((a, b) => {
-      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
-      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
-      if (aH264 !== bH264) return bH264 - aH264;
-      return (b.height || 0) - (a.height || 0);
-    });
-
-    if (adaptive.length > 0) {
-      const best = adaptive[0];
-      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('av01') ? 'AV1' : '';
-      return {
-        url: best.url,
-        provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
-        bitrate: Math.round((best.bitrate || 0) / 1000),
-        width: best.width || 0,
-        height: best.height || 0
-      };
-    }
-
-    // Fallback: muxed formats (video+audio, 720p max from WEB, 360p from ANDROID)
-    const muxedRaw = streamingData.formats || [];
-    const muxed = [];
-    for (const f of muxedRaw) {
-      try {
-        const url = await getFormatUrl(f, yt.session.player);
-        if (url) muxed.push({ ...f, url });
-      } catch { /* skip */ }
-    }
-    muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
-
-    if (muxed.length > 0) {
-      const best = muxed[0];
-      return {
-        url: best.url,
-        provider: `YouTube ${best.quality_label || '360p'}`,
-        bitrate: Math.round((best.bitrate || 0) / 1000),
-        width: best.width || 0,
-        height: best.height || 0
-      };
-    }
-
-    return null;
-  } catch (e) {
-    return null;
   }
+
+  return null;
 }
 
-// Debug: step-by-step YouTube resolution to identify failures
+// Debug endpoint: test all clients and report what each returns
 async function resolveYouTubeDebug(videoId) {
-  const stages = { videoId, timestamp: new Date().toISOString() };
-  let yt;
+  const stages = { videoId, timestamp: new Date().toISOString(), approach: 'direct-innertube' };
 
-  // Stage 1: QuickJS WASM
-  try {
-    if (!_quickjs) _quickjs = await getQuickJSWASMModule();
-    stages.quickjs = 'ok';
-  } catch (e) {
-    stages.quickjs = `FAILED: ${e.message}`;
-    return stages;
-  }
-
-  // Stage 2: Innertube session
-  try {
-    Platform.shim.fetch = (input, init) => fetch(input, init);
-    Platform.shim.eval = async (data, env) => {
-      const vm = _quickjs.newContext();
-      try {
-        let code = '';
-        for (const [key, value] of Object.entries(env || {})) {
-          code += `var ${key} = ${JSON.stringify(value)};\n`;
-        }
-        code += data.output;
-        const result = vm.evalCode(code);
-        if (result.error) {
-          const err = vm.dump(result.error);
-          result.error.dispose();
-          throw new Error(`QuickJS: ${JSON.stringify(err)}`);
-        }
-        const value = vm.dump(result.value);
-        result.value.dispose();
-        return value;
-      } finally { vm.dispose(); }
-    };
-    let debugPot, debugVd;
-    try {
-      const potResult = await getPoToken();
-      debugPot = potResult.poToken;
-      debugVd = potResult.visitorData;
-    } catch (pe) {
-      stages.poTokenCrash = pe.message;
-    }
-    const debugOpts = { retrieve_player: true, generate_session_locally: true, enable_safety_mode: false };
-    if (debugPot) debugOpts.po_token = debugPot;
-    if (debugVd) debugOpts.visitor_data = debugVd;
-    yt = await Innertube.create(debugOpts);
-    stages.innertube = 'ok';
-    stages.player = yt.session?.player ? 'loaded' : 'missing';
-    stages.poToken = {
-      type: _poTokenType,
-      expires: _poTokenExpiry ? new Date(_poTokenExpiry).toISOString() : null,
-      error: _poTokenError,
-    };
-  } catch (e) {
-    stages.innertube = `FAILED: ${e.message}`;
-    return stages;
-  }
-
-  // Stage 3: getBasicInfo — try each client type, report details
-  let info = null;
-  let usedClient = null;
+  let bestResult = null;
   stages.clients = {};
-  for (const client of YOUTUBE_CLIENTS) {
+
+  for (const client of YT_CLIENTS) {
     try {
-      const result = await yt.getBasicInfo(videoId, { client });
-      const adaptiveVideo = (result.streaming_data?.adaptive_formats || [])
-        .filter(f => f.mime_type?.startsWith('video/'));
-      const bestAdaptive = adaptiveVideo.sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-      stages.clients[client] = {
-        playability: result.playability_status?.status || 'unknown',
-        reason: result.playability_status?.reason || null,
-        muxedFormats: result.streaming_data?.formats?.length || 0,
-        adaptiveFormats: adaptiveVideo.length,
-        bestAdaptive: bestAdaptive ? `${bestAdaptive.quality_label} ${bestAdaptive.mime_type?.split(';')[0]}` : 'none'
+      const data = await ytPlayerRequest(videoId, client);
+      const status = data.playabilityStatus?.status || 'unknown';
+      const reason = data.playabilityStatus?.reason || null;
+      const sd = data.streamingData;
+
+      const muxedFormats = (sd?.formats || []).filter(f => f.url);
+      const adaptiveFormats = (sd?.adaptiveFormats || []).filter(f => f.url);
+
+      const bestMuxed = pickBestMuxed(sd || {});
+
+      const hlsUrl = sd?.hlsManifestUrl || null;
+
+      stages.clients[client.label] = {
+        playability: status,
+        reason,
+        hlsManifestUrl: hlsUrl ? hlsUrl.substring(0, 80) + '...' : null,
+        muxedFormats: muxedFormats.length,
+        adaptiveFormats: adaptiveFormats.length,
+        bestMuxed: bestMuxed ? `${bestMuxed.qualityLabel || bestMuxed.height + 'p'} ${bestMuxed.mimeType?.split(';')[0] || ''}` : 'none',
+        muxedDetails: muxedFormats.map(f => ({
+          itag: f.itag,
+          quality: f.qualityLabel || `${f.height}p`,
+          mime: f.mimeType?.split(';')[0],
+          width: f.width,
+          height: f.height,
+          bitrate: Math.round((f.bitrate || 0) / 1000) + 'kbps',
+          urlPrefix: f.url?.substring(0, 60) + '...',
+        })),
       };
-      if (!info && result.playability_status?.status === 'OK' && result.streaming_data) {
-        info = result;
-        usedClient = client;
+
+      if (!bestResult && status === 'OK') {
+        if (hlsUrl) {
+          // Test HLS manifest
+          try {
+            const hlsRes = await fetchWithTimeout(hlsUrl, {}, 5000);
+            if (hlsRes.ok) {
+              const masterText = await hlsRes.text();
+              const hlsBest = parseHlsBestQuality(masterText);
+              if (hlsBest) {
+                bestResult = {
+                  type: 'HLS',
+                  client: client.label,
+                  quality: `${hlsBest.height || '?'}p`,
+                  bandwidth: Math.round((hlsBest.bandwidth || 0) / 1000) + 'kbps',
+                  url: hlsUrl.substring(0, 100) + '...',
+                };
+                stages.clients[client.label].hlsQualities = masterText.match(/RESOLUTION=\d+x\d+/g) || [];
+              }
+            }
+          } catch { /* HLS test failed */ }
+        }
+        if (!bestResult && bestMuxed) {
+          bestResult = {
+            type: 'muxed',
+            client: client.label,
+            quality: bestMuxed.qualityLabel || `${bestMuxed.height}p`,
+            url: bestMuxed.url?.substring(0, 100) + '...',
+          };
+        }
       }
     } catch (e) {
-      stages.clients[client] = { error: e.message };
+      stages.clients[client.label] = { error: e.message };
     }
   }
 
-  if (!info) {
-    stages.bestClient = 'none';
-    return stages;
-  }
-  stages.bestClient = usedClient;
-
-  // List ALL adaptive video formats for 4K research
-  const allAdaptive = (info.streaming_data?.adaptive_formats || [])
-    .filter(f => f.mime_type?.startsWith('video/'))
-    .sort((a, b) => (b.height || 0) - (a.height || 0))
-    .map(f => ({
-      itag: f.itag,
-      quality: f.quality_label,
-      codec: f.mime_type?.split(';')[0],
-      codecs: f.mime_type?.match(/codecs="([^"]+)"/)?.[1] || '',
-      width: f.width, height: f.height,
-      bitrate: Math.round((f.bitrate || 0) / 1000) + 'kbps',
-      hasUrl: !!f.url,
-    }));
-  stages.allFormats = allAdaptive;
-
-  // Stage 4: test best adaptive format (what the resolver actually uses)
-  const adaptiveVideo = (info.streaming_data?.adaptive_formats || [])
-    .filter(f => f.mime_type?.startsWith('video/'))
-    .sort((a, b) => {
-      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
-      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
-      if (aH264 !== bH264) return bH264 - aH264;
-      return (b.height || 0) - (a.height || 0);
-    });
-
-  if (adaptiveVideo.length > 0) {
-    const best = adaptiveVideo[0];
-    try {
-      const url = await getFormatUrl(best, yt.session.player);
-      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('vp9') ? 'VP9' : '';
-      stages.bestFormat = `${best.quality_label} ${codec} ${Math.round((best.bitrate || 0) / 1000)}kbps`;
-      stages.decipherAdaptive = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
-    } catch (e) {
-      stages.decipherAdaptive = `FAILED: ${e.message}`;
-    }
-  }
-
-  // Also test muxed as fallback info
-  if (info.streaming_data?.formats?.length > 0) {
-    const f = info.streaming_data.formats[0];
-    try {
-      const url = await getFormatUrl(f, yt.session.player);
-      stages.decipherMuxed = url ? `ok (${f.quality_label || '360p'})` : 'null url';
-    } catch (e) {
-      stages.decipherMuxed = `FAILED: ${e.message}`;
-    }
-  }
-
+  stages.bestResult = bestResult || 'none — no client returned usable formats';
   return stages;
 }
 
@@ -1335,7 +998,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v56:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v57:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
