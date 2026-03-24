@@ -44,6 +44,7 @@ function getManifest(lang) {
 
 const CACHE_TTL = 86400; // 24 hours
 const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
+const TVDB_API_KEY = 'e58cf7f7-2730-48e0-bff9-dc0bd6ab9d38';
 
 // ============== UTILITIES ==============
 
@@ -515,6 +516,72 @@ async function getAniListYouTubeKey(malId) {
       return trailer.id.trim(); // AniList sometimes has trailing whitespace
     }
   } catch { /* AniList unavailable */ }
+  return null;
+}
+
+// ============== TVDB TRAILER FALLBACK ==============
+
+let _tvdbToken = null;
+let _tvdbTokenExpiry = 0;
+
+async function getTvdbToken() {
+  if (_tvdbToken && Date.now() < _tvdbTokenExpiry) return _tvdbToken;
+  const res = await fetchWithTimeout('https://api4.thetvdb.com/v4/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apikey: TVDB_API_KEY })
+  }, 5000);
+  const data = await res.json();
+  _tvdbToken = data?.data?.token;
+  _tvdbTokenExpiry = Date.now() + 23 * 60 * 60 * 1000; // ~23 hours
+  return _tvdbToken;
+}
+
+async function getTvdbYouTubeKey(imdbId, lang = 'en') {
+  if (!imdbId) return null;
+  try {
+    const token = await getTvdbToken();
+    if (!token) return null;
+    const headers = { Authorization: `Bearer ${token}` };
+
+    // Search TVDB by IMDb ID
+    const searchRes = await fetchWithTimeout(
+      `https://api4.thetvdb.com/v4/search/remoteid/${imdbId}`,
+      { headers }, 5000
+    );
+    const searchData = await searchRes.json();
+    const entry = searchData?.data?.[0];
+
+    // Get the TVDB series or movie ID
+    const seriesId = entry?.series?.id;
+    const movieId = entry?.movie?.id;
+    if (!seriesId && !movieId) return null;
+
+    // Fetch extended data with trailers
+    const type = seriesId ? 'series' : 'movies';
+    const id = seriesId || movieId;
+    const extRes = await fetchWithTimeout(
+      `https://api4.thetvdb.com/v4/${type}/${id}/extended`,
+      { headers }, 5000
+    );
+    const extData = await extRes.json();
+    const trailers = extData?.data?.trailers;
+    if (!trailers?.length) return null;
+
+    // Map lang codes: en→eng, fr→fra, de→deu, ja→jpn, etc.
+    const langMap = { en:'eng', fr:'fra', de:'deu', es:'spa', pt:'por', it:'ita', ru:'rus', ja:'jpn', ko:'kor', cs:'ces', hi:'hin', tr:'tur', ar:'ara' };
+    const tvdbLang = langMap[lang] || 'eng';
+
+    // Prefer trailer in user's language, then English, then any
+    const pick = trailers.find(t => t.language === tvdbLang && t.url?.includes('youtube'))
+      || trailers.find(t => t.language === 'eng' && t.url?.includes('youtube'))
+      || trailers.find(t => t.url?.includes('youtube'));
+    if (!pick?.url) return null;
+
+    // Extract YouTube ID from URL
+    const match = pick.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+    return match ? match[1] : null;
+  } catch { /* TVDB unavailable */ }
   return null;
 }
 
@@ -1241,6 +1308,10 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
       const { wikidataIds } = await metaReady.promise;
       const aniListKey = await getAniListYouTubeKey(wikidataIds?.malId);
       if (aniListKey) return resolveYouTube(aniListKey);
+
+      // TVDB fallback: search by IMDb ID, get trailers (localized)
+      const tvdbKey = await getTvdbYouTubeKey(imdbId, lang);
+      if (tvdbKey) return resolveYouTube(tvdbKey);
 
       return null;
     })(),
