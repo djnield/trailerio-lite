@@ -700,10 +700,10 @@ async function getPoToken() {
     const itJson = await itResponse.json();
     const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = itJson;
 
-    // 4. Mint po_token using WebPoMinter
-    const integrityTokenData = { integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken };
-    const webPoMinter = await BG.WebPoMinter.create(integrityTokenData, webPoSignalOutput);
-    const poToken = await webPoMinter.mintAsWebsafeString(_visitorData);
+    // 4. Use websafeFallbackToken as po_token directly
+    // WebPoMinter needs a minter function from webPoSignalOutput[0] which can't cross
+    // the QuickJS→main context boundary. The fallback token from GenerateIT works instead.
+    const poToken = websafeFallbackToken || integrityToken;
 
     _poToken = poToken;
     _poTokenExpiry = Date.now() + ((estimatedTtlSecs || 3600) * 1000);
