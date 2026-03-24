@@ -697,8 +697,8 @@ async function getPoToken() {
     if (!_quickjs) _quickjs = await getQuickJSWASMModule();
     const qjsVm = _quickjs.newContext();
 
-    let botguardResponse, webPoSignalOutput;
-    try {
+    let botguardResponse;
+    {
       // Build a self-contained script: mock DOM + interpreter + snapshot
       const mockDomCode = `
         var window = globalThis; var self = globalThis; var top = globalThis; var parent = globalThis;
@@ -854,6 +854,7 @@ async function getPoToken() {
         _poTokenType = hasMinter ? 'websafe-fallback' : 'no-minter-fallback';
       }
 
+    } // end BotGuard block
     qjsVm.dispose(); // Done with BotGuard context
 
     _poToken = poToken;
