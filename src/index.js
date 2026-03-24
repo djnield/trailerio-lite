@@ -497,8 +497,8 @@ async function resolveIMDb(imdbId) {
 // ============== YOUTUBE RESOLVER ==============
 
 // Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
-// TV_EMBEDDED and ANDROID clients are less likely to be blocked from datacenter IPs
-const YOUTUBE_CLIENTS = ['TV_EMBEDDED', 'ANDROID', 'WEB'];
+// IOS/ANDROID clients are less blocked from datacenter IPs than WEB; TV_EMBEDDED always fails
+const YOUTUBE_CLIENTS = ['IOS', 'ANDROID', 'WEB'];
 
 // Get URL from format — use direct URL if available, decipher only when needed
 async function getFormatUrl(f, player) {
@@ -545,11 +545,21 @@ async function getInnertube() {
     }
   };
 
-  _innertube = await Innertube.create({
-    retrieve_player: true,
-    generate_session_locally: true,
-    enable_safety_mode: false,
-  });
+  // Try fetching real session from YouTube (proper visitor_data, looks legitimate)
+  // Fall back to local generation if the network call fails
+  try {
+    _innertube = await Innertube.create({
+      retrieve_player: true,
+      generate_session_locally: false,
+      enable_safety_mode: false,
+    });
+  } catch {
+    _innertube = await Innertube.create({
+      retrieve_player: true,
+      generate_session_locally: true,
+      enable_safety_mode: false,
+    });
+  }
   _innertubeRefresh = now;
   return _innertube;
 }
@@ -573,29 +583,8 @@ async function resolveYouTube(youtubeKey) {
     const streamingData = info.streaming_data;
     if (!streamingData) return null;
 
-    // Try muxed formats first (video+audio combined, simpler for players)
-    const muxedRaw = streamingData.formats || [];
-    const muxed = [];
-    for (const f of muxedRaw) {
-      try {
-        const url = await getFormatUrl(f, yt.session.player);
-        if (url) muxed.push({ ...f, url });
-      } catch { /* skip failed decipher */ }
-    }
-    muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
-
-    if (muxed.length > 0) {
-      const best = muxed[0];
-      return {
-        url: best.url,
-        provider: `YouTube ${best.quality_label || '360p'}`,
-        bitrate: Math.round((best.bitrate || 0) / 1000),
-        width: best.width || 0,
-        height: best.height || 0
-      };
-    }
-
-    // Fallback: adaptive formats (video-only, prefer H.264 for iOS/tvOS)
+    // Try ADAPTIVE first — 720p/1080p/4K video-only (much better quality)
+    // Prefer H.264 for iOS/tvOS compatibility, then sort by resolution
     const adaptiveRaw = (streamingData.adaptive_formats || [])
       .filter(f => f.mime_type?.startsWith('video/'));
     const adaptive = [];
@@ -618,6 +607,28 @@ async function resolveYouTube(youtubeKey) {
       return {
         url: best.url,
         provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
+        bitrate: Math.round((best.bitrate || 0) / 1000),
+        width: best.width || 0,
+        height: best.height || 0
+      };
+    }
+
+    // Fallback: muxed formats (video+audio combined, 360p max but has audio)
+    const muxedRaw = streamingData.formats || [];
+    const muxed = [];
+    for (const f of muxedRaw) {
+      try {
+        const url = await getFormatUrl(f, yt.session.player);
+        if (url) muxed.push({ ...f, url });
+      } catch { /* skip failed decipher */ }
+    }
+    muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
+
+    if (muxed.length > 0) {
+      const best = muxed[0];
+      return {
+        url: best.url,
+        provider: `YouTube ${best.quality_label || '360p'}`,
         bitrate: Math.round((best.bitrate || 0) / 1000),
         width: best.width || 0,
         height: best.height || 0
@@ -666,7 +677,13 @@ async function resolveYouTubeDebug(videoId) {
         return value;
       } finally { vm.dispose(); }
     };
-    yt = await Innertube.create({ retrieve_player: true, generate_session_locally: true, enable_safety_mode: false });
+    try {
+      yt = await Innertube.create({ retrieve_player: true, generate_session_locally: false, enable_safety_mode: false });
+      stages.session = 'remote';
+    } catch {
+      yt = await Innertube.create({ retrieve_player: true, generate_session_locally: true, enable_safety_mode: false });
+      stages.session = 'local-fallback';
+    }
     stages.innertube = 'ok';
     stages.player = yt.session?.player ? 'loaded' : 'missing';
   } catch (e) {
@@ -674,20 +691,24 @@ async function resolveYouTubeDebug(videoId) {
     return stages;
   }
 
-  // Stage 3: getBasicInfo — try each client type
+  // Stage 3: getBasicInfo — try each client type, report details
   let info = null;
   let usedClient = null;
   stages.clients = {};
   for (const client of YOUTUBE_CLIENTS) {
     try {
       const result = await yt.getBasicInfo(videoId, { client });
+      const adaptiveVideo = (result.streaming_data?.adaptive_formats || [])
+        .filter(f => f.mime_type?.startsWith('video/'));
+      const bestAdaptive = adaptiveVideo.sort((a, b) => (b.height || 0) - (a.height || 0))[0];
       stages.clients[client] = {
         playability: result.playability_status?.status || 'unknown',
         reason: result.playability_status?.reason || null,
         muxedFormats: result.streaming_data?.formats?.length || 0,
-        adaptiveFormats: result.streaming_data?.adaptive_formats?.length || 0
+        adaptiveFormats: adaptiveVideo.length,
+        bestAdaptive: bestAdaptive ? `${bestAdaptive.quality_label} ${bestAdaptive.mime_type?.split(';')[0]}` : 'none'
       };
-      if (result.playability_status?.status === 'OK' && result.streaming_data) {
+      if (!info && result.playability_status?.status === 'OK' && result.streaming_data) {
         info = result;
         usedClient = client;
       }
@@ -702,24 +723,36 @@ async function resolveYouTubeDebug(videoId) {
   }
   stages.bestClient = usedClient;
 
-  // Stage 4: decipher first format using the working client's data
-  if (info.streaming_data?.formats?.length > 0) {
-    try {
-      const f = info.streaming_data.formats[0];
-      const url = await getFormatUrl(f, yt.session.player);
-      stages.decipherMuxed = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
-    } catch (e) {
-      stages.decipherMuxed = `FAILED: ${e.message}`;
-    }
-  }
+  // Stage 4: test best adaptive format (what the resolver actually uses)
+  const adaptiveVideo = (info.streaming_data?.adaptive_formats || [])
+    .filter(f => f.mime_type?.startsWith('video/'))
+    .sort((a, b) => {
+      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
+      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
+      if (aH264 !== bH264) return bH264 - aH264;
+      return (b.height || 0) - (a.height || 0);
+    });
 
-  if (info.streaming_data?.adaptive_formats?.length > 0) {
+  if (adaptiveVideo.length > 0) {
+    const best = adaptiveVideo[0];
     try {
-      const f = info.streaming_data.adaptive_formats[0];
-      const url = await getFormatUrl(f, yt.session.player);
+      const url = await getFormatUrl(best, yt.session.player);
+      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('vp9') ? 'VP9' : '';
+      stages.bestFormat = `${best.quality_label} ${codec} ${Math.round((best.bitrate || 0) / 1000)}kbps`;
       stages.decipherAdaptive = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
     } catch (e) {
       stages.decipherAdaptive = `FAILED: ${e.message}`;
+    }
+  }
+
+  // Also test muxed as fallback info
+  if (info.streaming_data?.formats?.length > 0) {
+    const f = info.streaming_data.formats[0];
+    try {
+      const url = await getFormatUrl(f, yt.session.player);
+      stages.decipherMuxed = url ? `ok (${f.quality_label || '360p'})` : 'null url';
+    } catch (e) {
+      stages.decipherMuxed = `FAILED: ${e.message}`;
     }
   }
 
