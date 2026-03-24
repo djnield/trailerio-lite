@@ -1295,7 +1295,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', baseUrl = '') {
-  const cacheKey = `trailer:v53:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v54:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
