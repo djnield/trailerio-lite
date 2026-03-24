@@ -29,7 +29,7 @@ function getManifest(lang) {
   const config = LANG_CONFIG[lang] || LANG_CONFIG.en;
   return {
     id: lang === 'en' ? 'io.trailerio.lite' : `io.trailerio.lite.${lang}`,
-    version: '1.5.0',
+    version: '1.6.0',
     name: lang === 'en' ? 'Trailerio' : `Trailerio ${config.label}`,
     description: lang === 'en'
       ? 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb'
@@ -973,9 +973,8 @@ async function resolveYouTube(youtubeKey) {
   try {
     const yt = await getInnertube();
 
-    // Try all clients, collect best result from each
-    // Priority: HLS (1080p, video+audio) → muxed MP4 (720p, video+audio) → skip adaptive (video-only)
-    let bestHls = null;
+    // Try all clients, find best muxed MP4 (direct URL — compatible with Fusion/Stremio)
+    // Skip HLS (.m3u8) — Fusion doesn't display HLS URLs as trailers
     let bestMuxed = null;
 
     for (const client of YOUTUBE_CLIENTS) {
@@ -984,52 +983,20 @@ async function resolveYouTube(youtubeKey) {
         if (info.playability_status?.status !== 'OK' || !info.streaming_data) continue;
         const sd = info.streaming_data;
 
-        // Check for HLS manifest (IOS client returns this — combined video+audio up to 1080p)
-        if (!bestHls && sd.hls_manifest_url) {
+        // Check for muxed formats (video+audio combined — direct MP4 URL)
+        const muxedRaw = sd.formats || [];
+        for (const f of muxedRaw) {
           try {
-            const hlsRes = await fetch(sd.hls_manifest_url);
-            if (hlsRes.ok) {
-              const masterText = await hlsRes.text();
-              const best = parseHlsBestQuality(masterText);
-              if (best) {
-                bestHls = {
-                  url: sd.hls_manifest_url,
-                  height: best.height || 1080,
-                  width: best.width || 0,
-                  bandwidth: best.bandwidth,
-                };
-              }
+            const url = await getFormatUrl(f, yt.session.player);
+            if (url && (!bestMuxed || (f.height || 0) > bestMuxed.height)) {
+              bestMuxed = { url, height: f.height || 0, width: f.width || 0, bitrate: f.bitrate || 0, quality_label: f.quality_label };
             }
-          } catch { /* HLS fetch failed */ }
+          } catch { /* skip */ }
         }
 
-        // Check for muxed formats (video+audio combined — plays everywhere)
-        if (!bestMuxed) {
-          const muxedRaw = sd.formats || [];
-          for (const f of muxedRaw) {
-            try {
-              const url = await getFormatUrl(f, yt.session.player);
-              if (url && (!bestMuxed || (f.height || 0) > bestMuxed.height)) {
-                bestMuxed = { url, height: f.height || 0, width: f.width || 0, bitrate: f.bitrate || 0, quality_label: f.quality_label };
-              }
-            } catch { /* skip */ }
-          }
-        }
-
-        // If we have HLS, no need to try more clients
-        if (bestHls) break;
+        // If we found a good muxed format, no need to try more clients
+        if (bestMuxed) break;
       } catch { /* try next client */ }
-    }
-
-    // Return best available: HLS > muxed
-    if (bestHls) {
-      return {
-        url: bestHls.url,
-        provider: `YouTube ${bestHls.height}p`,
-        bitrate: Math.round((bestHls.bandwidth || 0) / 1000),
-        width: bestHls.width,
-        height: bestHls.height,
-      };
     }
 
     if (bestMuxed) {
@@ -1141,32 +1108,9 @@ async function resolveYouTubeDebug(videoId) {
   }
   stages.bestClient = usedClient;
 
-  // Stage 4: Test HLS manifest (what resolver prefers — 1080p video+audio)
-  stages.formatPriority = 'HLS (1080p) → muxed MP4 (720p) → adaptive is SKIPPED (video-only)';
+  // Stage 4: Test muxed formats (direct MP4 — Fusion compatible)
+  stages.formatPriority = 'muxed MP4 (720p, direct URL) → HLS skipped (Fusion incompatible)';
 
-  if (info.streaming_data?.hls_manifest_url) {
-    try {
-      const hlsRes = await fetch(info.streaming_data.hls_manifest_url);
-      if (hlsRes.ok) {
-        const masterText = await hlsRes.text();
-        const hlsBest = parseHlsBestQuality(masterText);
-        stages.hls = {
-          status: 'ok',
-          bestQuality: hlsBest ? `${hlsBest.height}p @ ${Math.round(hlsBest.bandwidth / 1000)}kbps` : 'unknown',
-          qualities: masterText.match(/RESOLUTION=\d+x\d+/g) || [],
-          url: info.streaming_data.hls_manifest_url.substring(0, 80) + '...',
-        };
-      } else {
-        stages.hls = { status: `fetch failed (${hlsRes.status})` };
-      }
-    } catch (e) {
-      stages.hls = { status: `error: ${e.message}` };
-    }
-  } else {
-    stages.hls = { status: 'not available from this client' };
-  }
-
-  // Stage 5: Test muxed formats (fallback — 720p video+audio)
   const muxedFormats = info.streaming_data?.formats || [];
   if (muxedFormats.length > 0) {
     const muxedResults = [];
@@ -1188,13 +1132,17 @@ async function resolveYouTubeDebug(videoId) {
     stages.muxed = 'none available';
   }
 
-  // Summary: what the resolver would actually return
+  // HLS info (for debugging only — not used by resolver)
   if (info.streaming_data?.hls_manifest_url) {
-    stages.resolverWouldReturn = 'HLS manifest (video+audio, up to 1080p)';
-  } else if (muxedFormats.length > 0) {
-    stages.resolverWouldReturn = `muxed MP4 (${muxedFormats[0]?.quality_label || '720p'}, video+audio)`;
+    stages.hlsAvailable = true;
+    stages.hlsNote = 'HLS available but skipped — Fusion does not display .m3u8 URLs as trailers';
+  }
+
+  // Summary: what the resolver would actually return
+  if (muxedFormats.length > 0) {
+    stages.resolverWouldReturn = `muxed MP4 (${muxedFormats[0]?.quality_label || '720p'}, video+audio, direct URL)`;
   } else {
-    stages.resolverWouldReturn = 'null — no playable format (adaptive skipped: video-only)';
+    stages.resolverWouldReturn = 'null — no playable format (HLS skipped, adaptive skipped)';
   }
 
   return stages;
@@ -1368,7 +1316,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) {
-  const cacheKey = `trailer:v60:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v61:${lang}:${imdbId}`;
   if (!fresh) {
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
     if (cached) {
