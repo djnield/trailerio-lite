@@ -497,9 +497,9 @@ async function resolveIMDb(imdbId) {
 // ============== YOUTUBE RESOLVER ==============
 
 // Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
-// WEB has 720p muxed (itag 22), IOS/ANDROID only have 360p muxed
-// But WEB is more likely to get 403'd from datacenter IPs, so try IOS/ANDROID as fallback
-const YOUTUBE_CLIENTS = ['WEB', 'IOS', 'ANDROID'];
+// IOS returns pre-signed adaptive URLs (1080p H.264), least blocked from datacenter IPs
+// ANDROID has pre-signed URLs too; WEB has most formats but gets 403'd more often
+const YOUTUBE_CLIENTS = ['IOS', 'ANDROID', 'WEB'];
 
 // Get URL from format — use direct URL if available, decipher only when needed
 async function getFormatUrl(f, player) {
@@ -574,15 +574,43 @@ async function resolveYouTube(youtubeKey) {
     const streamingData = info.streaming_data;
     if (!streamingData) return null;
 
-    // MUXED formats (video+audio combined) — required for AVFoundation players
-    // WEB client has itag 22 (720p), ANDROID only has itag 18 (360p)
+    // Try ADAPTIVE first — 1080p+ H.264 video (works on Fusion/AVFoundation)
+    const adaptiveRaw = (streamingData.adaptive_formats || [])
+      .filter(f => f.mime_type?.startsWith('video/'));
+    const adaptive = [];
+    for (const f of adaptiveRaw) {
+      try {
+        const url = await getFormatUrl(f, yt.session.player);
+        if (url) adaptive.push({ ...f, url });
+      } catch { /* skip */ }
+    }
+    adaptive.sort((a, b) => {
+      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
+      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
+      if (aH264 !== bH264) return bH264 - aH264;
+      return (b.height || 0) - (a.height || 0);
+    });
+
+    if (adaptive.length > 0) {
+      const best = adaptive[0];
+      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('vp9') ? 'VP9' : '';
+      return {
+        url: best.url,
+        provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
+        bitrate: Math.round((best.bitrate || 0) / 1000),
+        width: best.width || 0,
+        height: best.height || 0
+      };
+    }
+
+    // Fallback: muxed formats (video+audio, 720p max from WEB, 360p from ANDROID)
     const muxedRaw = streamingData.formats || [];
     const muxed = [];
     for (const f of muxedRaw) {
       try {
         const url = await getFormatUrl(f, yt.session.player);
         if (url) muxed.push({ ...f, url });
-      } catch { /* skip failed decipher */ }
+      } catch { /* skip */ }
     }
     muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
 
@@ -883,7 +911,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v45:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v46:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
