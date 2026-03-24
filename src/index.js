@@ -29,7 +29,7 @@ function getManifest(lang) {
   const config = LANG_CONFIG[lang] || LANG_CONFIG.en;
   return {
     id: lang === 'en' ? 'io.trailerio.lite' : `io.trailerio.lite.${lang}`,
-    version: '1.3.0',
+    version: '1.4.0',
     name: lang === 'en' ? 'Trailerio' : `Trailerio ${config.label}`,
     description: lang === 'en'
       ? 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb'
@@ -1368,7 +1368,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v58:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v59:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
