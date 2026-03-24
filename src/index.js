@@ -61,6 +61,26 @@ async function fetchWithTimeout(url, options = {}, timeout = 6000) {
   }
 }
 
+// ============== D1 CACHE HELPERS ==============
+
+async function d1Get(db, key) {
+  if (!db) return null;
+  try {
+    const row = await db.prepare('SELECT value, expires_at FROM cache WHERE key = ?').bind(key).first();
+    if (!row || row.expires_at < Math.floor(Date.now() / 1000)) return null;
+    return JSON.parse(row.value);
+  } catch { return null; }
+}
+
+async function d1Set(db, key, value, ttlSeconds) {
+  if (!db) return;
+  try {
+    const expires = Math.floor(Date.now() / 1000) + ttlSeconds;
+    await db.prepare('INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)')
+      .bind(key, JSON.stringify(value), expires).run();
+  } catch { /* silent */ }
+}
+
 // ============== SMIL PARSER ==============
 
 // Parse SMIL XML and return best quality video (highest bitrate)
@@ -82,7 +102,11 @@ function parseSMIL(smilXml) {
 
 // ============== TMDB METADATA ==============
 
-async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en') {
+async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en', db = null) {
+  const d1Key = `tmdb:${lang}:${imdbId}`;
+  const cached = await d1Get(db, d1Key);
+  if (cached) return cached;
+
   try {
     const findRes = await fetchWithTimeout(
       `https://api.themoviedb.org/3/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`
@@ -126,7 +150,7 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en') {
       });
     const youtubeKeys = ytVideos.slice(0, 3).map(v => v.key);
 
-    return {
+    const tmdbMeta = {
       tmdbId,
       title,
       wikidataId: extData.wikidata_id,
@@ -134,14 +158,20 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en') {
       actualType,
       youtubeKeys
     };
+    d1Set(db, d1Key, tmdbMeta, 604800); // 7 days, fire-and-forget
+    return tmdbMeta;
   } catch (e) {
     return null;
   }
 }
 
 // Get Apple TV / RT / Fandango / MUBI IDs from Wikidata entity
-async function getWikidataIds(wikidataId) {
+async function getWikidataIds(wikidataId, db = null) {
   if (!wikidataId) return {};
+
+  const d1Key = `wd:${wikidataId}`;
+  const cached = await d1Get(db, d1Key);
+  if (cached) return cached;
 
   try {
     const res = await fetchWithTimeout(
@@ -157,7 +187,7 @@ async function getWikidataIds(wikidataId) {
     const appleTvMovieId = entity.claims?.P9586?.[0]?.mainsnak?.datavalue?.value;
     const appleTvShowId = entity.claims?.P9751?.[0]?.mainsnak?.datavalue?.value;
 
-    return {
+    const ids = {
       appleTvId: appleTvMovieId || appleTvShowId,
       isAppleTvShow: !!appleTvShowId && !appleTvMovieId,
       rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value,
@@ -174,6 +204,8 @@ async function getWikidataIds(wikidataId) {
       movieplayerFilmId: entity.claims?.P4783?.[0]?.mainsnak?.datavalue?.value,
       movieplayerSeriesId: entity.claims?.P4784?.[0]?.mainsnak?.datavalue?.value,
     };
+    d1Set(db, d1Key, ids, 604800); // 7 days, fire-and-forget
+    return ids;
   } catch (e) {
     return {};
   }
@@ -1414,13 +1446,17 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) {
-  const cacheKey = `trailer:v64:${lang}:${imdbId}`;
+async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, db = null) {
+  const cacheKey = `trailer:v65:${lang}:${imdbId}`;
   if (!fresh) {
+    // Check edge cache first (fastest, per-PoP)
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
     if (cached) {
       return await cached.json();
     }
+    // Fall back to D1 (global, persistent)
+    const d1Cached = await d1Get(db, cacheKey);
+    if (d1Cached) return d1Cached;
   }
 
   // Shared deferred signals - sources await these instead of blocking in phases
@@ -1431,11 +1467,11 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) 
   // TMDB find → external_ids → Wikidata: chained but non-blocking to sources
   const metaPipeline = (async () => {
     try {
-      const tmdbMeta = await getTMDBMetadata(imdbId, type, lang);
+      const tmdbMeta = await getTMDBMetadata(imdbId, type, lang, db);
       tmdbReady.resolve(tmdbMeta);  // unblocks Plex immediately
 
       const wikidataIds = tmdbMeta?.wikidataId
-        ? await getWikidataIds(tmdbMeta.wikidataId)
+        ? await getWikidataIds(tmdbMeta.wikidataId, db)
         : {};
       metaReady.resolve({ tmdbMeta, wikidataIds });  // unblocks all Phase 3 sources
       return { tmdbMeta, wikidataIds };
@@ -1574,6 +1610,8 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) 
       headers: { 'Cache-Control': `max-age=${ttl}` }
     });
     await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
+    // Persist in D1 (global, survives edge eviction)
+    d1Set(db, cacheKey, result, ttl);
   }
 
   return result;
@@ -1632,7 +1670,7 @@ export default {
       const imdbId = id.split(':')[0];
       const fresh = url.searchParams.has('fresh');
 
-      const result = await resolveTrailers(imdbId, type, cache, lang, fresh);
+      const result = await resolveTrailers(imdbId, type, cache, lang, fresh, env.DB);
 
       return new Response(JSON.stringify({
         meta: {
