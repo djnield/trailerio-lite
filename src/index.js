@@ -791,14 +791,25 @@ async function getPoToken() {
     const itJson = await itResponse.json();
     const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = itJson;
 
-    // 4. Use websafeFallbackToken as po_token directly
-    // WebPoMinter needs a minter function from webPoSignalOutput[0] which can't cross
-    // the QuickJS→main context boundary. The fallback token from GenerateIT works instead.
-    const poToken = websafeFallbackToken || integrityToken;
+    // 4. Try minting proper po_token, fall back to websafeFallbackToken
+    let poToken;
+    const integrityTokenData = { integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken };
+    try {
+      if (webPoSignalOutput?.[0] && typeof webPoSignalOutput[0] === 'function') {
+        const webPoMinter = await BG.WebPoMinter.create(integrityTokenData, webPoSignalOutput);
+        poToken = await webPoMinter.mintAsWebsafeString(_visitorData);
+        _poTokenType = 'minted';
+      } else {
+        poToken = websafeFallbackToken || integrityToken;
+        _poTokenType = 'websafe-fallback';
+      }
+    } catch {
+      poToken = websafeFallbackToken || integrityToken;
+      _poTokenType = 'websafe-fallback';
+    }
 
     _poToken = poToken;
     _poTokenExpiry = Date.now() + ((estimatedTtlSecs || 3600) * 1000);
-    _poTokenType = 'full';
     _poTokenError = null;
 
     return { poToken: _poToken, visitorData: _visitorData };
@@ -997,7 +1008,14 @@ async function resolveYouTubeDebug(videoId) {
         return value;
       } finally { vm.dispose(); }
     };
-    const { poToken: debugPot, visitorData: debugVd } = await getPoToken();
+    let debugPot, debugVd;
+    try {
+      const potResult = await getPoToken();
+      debugPot = potResult.poToken;
+      debugVd = potResult.visitorData;
+    } catch (pe) {
+      stages.poTokenCrash = pe.message;
+    }
     const debugOpts = { retrieve_player: true, generate_session_locally: true, enable_safety_mode: false };
     if (debugPot) debugOpts.po_token = debugPot;
     if (debugVd) debugOpts.visitor_data = debugVd;
