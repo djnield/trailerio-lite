@@ -50,17 +50,36 @@ function generateColdStartToken(identifier) {
 // ============== INNERTUBE PLAYER API (replaces youtubei.js) ==============
 
 const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-const IOS_UA = 'com.google.ios.youtube/20.11.6 (iPhone10,4; U; CPU iOS 16_7_7 like Mac OS X)';
 
-function buildPlayerBody(videoId, visitorData, poToken) {
+// Multiple client configs — different rate limit pools
+const CLIENTS = [
+  {
+    name: 'IOS', id: '5',
+    clientName: 'iOS', clientVersion: '20.11.6',
+    ua: 'com.google.ios.youtube/20.11.6 (iPhone10,4; U; CPU iOS 16_7_7 like Mac OS X)',
+    extra: { deviceMake: 'Apple', deviceModel: 'iPhone10,4', osName: 'iOS', osVersion: '16.7.7.20H330', platform: 'MOBILE' },
+  },
+  {
+    name: 'ANDROID', id: '3',
+    clientName: 'ANDROID', clientVersion: '21.03.36',
+    ua: 'com.google.android.youtube/21.03.36(Linux; U; Android 16; en_US; SM-S908E Build/TP1A.220624.014) gzip',
+    extra: { deviceMake: 'Samsung', deviceModel: 'SM-S908E', osName: 'Android', osVersion: '16', platform: 'MOBILE', androidSdkVersion: 36 },
+  },
+  {
+    name: 'TV', id: '7',
+    clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0',
+    ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Version/5.0 TV Safari/537.36',
+    extra: { platform: 'TV' },
+  },
+];
+
+function buildPlayerBody(videoId, visitorData, poToken, client) {
   const body = {
     context: {
       client: {
         hl: 'en', gl: 'US', visitorData,
-        clientName: 'iOS', clientVersion: '20.11.6',
-        deviceMake: 'Apple', deviceModel: 'iPhone10,4',
-        osName: 'iOS', osVersion: '16.7.7.20H330',
-        platform: 'MOBILE',
+        clientName: client.clientName, clientVersion: client.clientVersion,
+        ...client.extra,
       },
       user: { enableSafetyMode: false },
       request: { useSsl: true, internalExperimentFlags: [] },
@@ -73,7 +92,7 @@ function buildPlayerBody(videoId, visitorData, poToken) {
   return body;
 }
 
-async function fetchPlayer(videoId, visitorData, poToken) {
+async function fetchPlayer(videoId, visitorData, poToken, client) {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 8000);
   try {
@@ -82,12 +101,12 @@ async function fetchPlayer(videoId, visitorData, poToken) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'User-Agent': IOS_UA,
+          'User-Agent': client.ua,
           'X-Goog-Visitor-Id': visitorData,
-          'X-Youtube-Client-Name': '5',
-          'X-Youtube-Client-Version': '20.11.6',
+          'X-Youtube-Client-Name': client.id,
+          'X-Youtube-Client-Version': client.clientVersion,
         },
-        body: JSON.stringify(buildPlayerBody(videoId, visitorData, poToken)),
+        body: JSON.stringify(buildPlayerBody(videoId, visitorData, poToken, client)),
         signal: controller.signal,
       }
     );
@@ -101,25 +120,7 @@ async function fetchPlayer(videoId, visitorData, poToken) {
 
 // ============== YOUTUBE RESOLVER ==============
 
-async function resolveYouTube(youtubeKey, db) {
-  if (!youtubeKey) return null;
-
-  // Check D1 cache (cached trailer URLs, not tokens)
-  const cached = await d1Get(db, `yt:v1:${youtubeKey}`);
-  if (cached) return cached;
-
-  // Fresh visitor + token per call (avoids multi-user token exhaustion)
-  const visitorData = generateVisitorData();
-  const poToken = generateColdStartToken(visitorData);
-
-  const data = await fetchPlayer(youtubeKey, visitorData, poToken);
-  if (!data || data.playabilityStatus?.status !== 'OK') return null;
-
-  const sd = data.streamingData;
-  if (!sd) return null;
-
-  let result = null;
-
+function extractResult(sd) {
   // Priority 1: Muxed MP4 (video+audio, direct play)
   const formats = sd.formats || [];
   let bestMuxed = null;
@@ -128,69 +129,85 @@ async function resolveYouTube(youtubeKey, db) {
       bestMuxed = { url: f.url, height: f.height || 0, width: f.width || 0, bitrate: f.bitrate || 0, qualityLabel: f.qualityLabel };
     }
   }
-
   if (bestMuxed) {
-    result = {
+    return {
       url: bestMuxed.url,
       provider: `YouTube ${bestMuxed.qualityLabel || bestMuxed.height + 'p'}`,
       bitrate: Math.round((bestMuxed.bitrate || 0) / 1000),
-      width: bestMuxed.width,
-      height: bestMuxed.height,
+      width: bestMuxed.width, height: bestMuxed.height,
     };
   }
 
   // Priority 2: HLS manifest (AVFoundation native)
-  if (!result && sd.hlsManifestUrl) {
+  if (sd.hlsManifestUrl) {
     const adaptive = (sd.adaptiveFormats || [])
       .filter(f => f.mimeType?.startsWith('video/'))
       .sort((a, b) => (b.height || 0) - (a.height || 0));
     const best = adaptive[0];
-    result = {
+    return {
       url: sd.hlsManifestUrl,
       provider: `YouTube ${best?.qualityLabel || 'HLS'}`,
       bitrate: best?.bitrate ? Math.round(best.bitrate / 1000) : 0,
-      width: best?.width || 0,
-      height: best?.height || 0,
+      width: best?.width || 0, height: best?.height || 0,
     };
   }
+  return null;
+}
 
-  // Cache in D1 for 6 hours (YouTube URLs expire in ~6h)
-  if (result) d1Set(db, `yt:v1:${youtubeKey}`, result, 21600);
-  return result;
+async function resolveYouTube(youtubeKey, db) {
+  if (!youtubeKey) return null;
+
+  // Check D1 cache (cached trailer URLs, not tokens)
+  const cached = await d1Get(db, `yt:v2:${youtubeKey}`);
+  if (cached) return cached;
+
+  // Try each client — fresh visitor per attempt (different rate limit pools)
+  for (const client of CLIENTS) {
+    try {
+      const visitorData = generateVisitorData();
+      const poToken = generateColdStartToken(visitorData);
+      const data = await fetchPlayer(youtubeKey, visitorData, poToken, client);
+      if (!data) continue;
+
+      const status = data.playabilityStatus?.status;
+      if (status === 'LOGIN_REQUIRED' || status === 'ERROR') continue; // try next client
+      if (status !== 'OK' || !data.streamingData) continue;
+
+      const result = extractResult(data.streamingData);
+      if (result) {
+        // Cache in D1 for 6 hours (YouTube URLs expire in ~6h)
+        await d1Set(db, `yt:v2:${youtubeKey}`, result, 21600);
+        return result;
+      }
+    } catch { /* try next client */ }
+  }
+
+  return null;
 }
 
 // ============== DEBUG ENDPOINT ==============
 
 async function resolveYouTubeDebug(videoId, db) {
-  const stages = { videoId, timestamp: new Date().toISOString() };
+  const stages = { videoId, timestamp: new Date().toISOString(), clients: {} };
 
-  const visitorData = generateVisitorData();
-  const poToken = generateColdStartToken(visitorData);
-  stages.visitorData = visitorData;
-  stages.poTokenType = 'cold-start-fresh';
+  for (const client of CLIENTS) {
+    const visitorData = generateVisitorData();
+    const poToken = generateColdStartToken(visitorData);
+    const data = await fetchPlayer(videoId, visitorData, poToken, client);
+    if (!data) { stages.clients[client.name] = { error: 'fetch failed' }; continue; }
 
-  const data = await fetchPlayer(videoId, visitorData, poToken);
-  if (!data) { stages.error = 'fetchPlayer returned null'; return stages; }
-
-  stages.playability = data.playabilityStatus?.status || 'unknown';
-  stages.reason = data.playabilityStatus?.reason || null;
-
-  const sd = data.streamingData;
-  if (sd) {
-    stages.muxedFormats = sd.formats?.length || 0;
-    stages.adaptiveFormats = (sd.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length;
-    stages.hlsManifestUrl = sd.hlsManifestUrl ? 'yes' : 'no';
-
-    const bestAdaptive = (sd.adaptiveFormats || [])
-      .filter(f => f.mimeType?.startsWith('video/'))
-      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-    stages.bestAdaptive = bestAdaptive ? `${bestAdaptive.qualityLabel} ${bestAdaptive.mimeType?.split(';')[0]}` : 'none';
+    const sd = data.streamingData;
+    stages.clients[client.name] = {
+      playability: data.playabilityStatus?.status || 'unknown',
+      reason: data.playabilityStatus?.reason || null,
+      muxedFormats: sd?.formats?.length || 0,
+      adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
+      hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
+    };
   }
 
-  // Test resolution
   const result = await resolveYouTube(videoId, db);
   stages.resolverResult = result ? result.provider : 'null';
-
   return stages;
 }
 
