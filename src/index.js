@@ -698,7 +698,7 @@ async function getPoToken() {
     const qjsVm = _quickjs.newContext();
 
     let botguardResponse, poToken, estimatedTtlSecs;
-    {
+    try {
       // Build a self-contained script: mock DOM + interpreter + snapshot
       const mockDomCode = `
         var window = globalThis; var self = globalThis; var top = globalThis; var parent = globalThis;
@@ -854,8 +854,9 @@ async function getPoToken() {
         _poTokenType = hasMinter ? 'websafe-fallback' : 'no-minter-fallback';
       }
 
-    } // end BotGuard block
-    qjsVm.dispose(); // Done with BotGuard context
+    } finally {
+      qjsVm.dispose();
+    }
 
     _poToken = poToken;
     _poTokenExpiry = Date.now() + ((estimatedTtlSecs || 3600) * 1000);
