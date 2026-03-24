@@ -159,7 +159,7 @@ async function getInnertube(db = null) {
   const { poToken, visitorData } = await getPoToken(db);
 
   const createOpts = {
-    retrieve_player: false,
+    retrieve_player: true,
     generate_session_locally: true,
     enable_safety_mode: false,
   };
@@ -215,6 +215,17 @@ async function resolveYouTube(youtubeKey, db = null) {
         }
 
         if (bestMuxed) break;
+
+        // No muxed — try HLS manifest (AVFoundation native, adaptive bitrate, includes audio)
+        if (!bestMuxed && sd.hls_manifest_url) {
+          return {
+            url: sd.hls_manifest_url,
+            provider: 'YouTube HLS',
+            bitrate: 0,
+            width: 1920,
+            height: 1080,
+          };
+        }
       } catch { /* try next client */ }
     }
 
@@ -323,7 +334,7 @@ async function resolveYouTubeDebug(videoId) {
   }
   stages.bestClient = usedClient;
 
-  stages.formatPriority = 'muxed MP4 (720p, direct URL) → HLS skipped (Fusion incompatible)';
+  stages.formatPriority = 'muxed MP4 (direct URL) → HLS manifest (AVFoundation native)';
 
   const muxedFormats = info.streaming_data?.formats || [];
   if (muxedFormats.length > 0) {
@@ -348,13 +359,13 @@ async function resolveYouTubeDebug(videoId) {
 
   if (info.streaming_data?.hls_manifest_url) {
     stages.hlsAvailable = true;
-    stages.hlsNote = 'HLS available but skipped — Fusion does not display .m3u8 URLs as trailers';
+    stages.hlsNote = 'HLS available — AVFoundation native playback (used as fallback when no muxed MP4)';
   }
 
   if (muxedFormats.length > 0) {
     stages.resolverWouldReturn = `muxed MP4 (${muxedFormats[0]?.quality_label || '720p'}, video+audio, direct URL)`;
   } else {
-    stages.resolverWouldReturn = 'null — no playable format (HLS skipped, adaptive skipped)';
+    stages.resolverWouldReturn = 'null — no playable format (no muxed MP4, no HLS manifest)';
   }
 
   return stages;
