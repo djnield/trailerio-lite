@@ -102,18 +102,31 @@ async function getTMDBMetadata(imdbId, type = 'movie') {
     const tmdbId = results[0].id;
     const title = results[0].title || results[0].name;
 
-    // Get external IDs including Wikidata
-    const extRes = await fetchWithTimeout(
-      `https://api.themoviedb.org/3/${actualType === 'series' ? 'tv' : 'movie'}/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`
-    );
-    const extData = await extRes.json();
+    // Get external IDs and YouTube trailer keys in parallel
+    const endpoint = actualType === 'series' ? 'tv' : 'movie';
+    const [extData, videosData] = await Promise.all([
+      fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`)
+        .then(r => r.json()).catch(() => ({})),
+      fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/videos?api_key=${TMDB_API_KEY}&language=en-US`)
+        .then(r => r.json()).catch(() => ({ results: [] }))
+    ]);
+
+    // Pick YouTube trailer keys, preferring official trailers
+    const ytVideos = (videosData.results || [])
+      .filter(v => v.site === 'YouTube' && v.key)
+      .sort((a, b) => {
+        const score = v => (v.type === 'Trailer' ? 0 : v.type === 'Teaser' ? 1 : 2);
+        return score(a) - score(b);
+      });
+    const youtubeKeys = ytVideos.slice(0, 3).map(v => v.key);
 
     return {
       tmdbId,
       title,
       wikidataId: extData.wikidata_id,
       imdbId,
-      actualType
+      actualType,
+      youtubeKeys
     };
   } catch (e) {
     return null;
@@ -478,6 +491,114 @@ async function resolveIMDb(imdbId) {
   return null;
 }
 
+// ============== YOUTUBE RESOLVER ==============
+
+// Itag priority: H.264 MP4 first (native iOS/tvOS), then VP9 4K (software decode in Stremio/Infuse)
+const YT_VIDEO_ITAGS = [
+  299, // 1080p60 H.264 MP4
+  298, // 720p60 H.264 MP4
+  137, // 1080p H.264 MP4
+  136, // 720p H.264 MP4
+  135, // 480p H.264 MP4
+  315, // 2160p60 VP9 WebM
+  313, // 2160p VP9 WebM
+  308, // 1440p60 VP9 WebM
+  303, // 1080p60 VP9 WebM
+  302, // 720p60 VP9 WebM
+];
+const YT_AUDIO_ITAGS = [140, 251]; // AAC MP4 (iOS native), Opus WebM
+
+function pickBestVideoFormat(formats) {
+  const vids = formats.filter(f => f.mimeType?.startsWith('video/') && f.url);
+  for (const itag of YT_VIDEO_ITAGS) {
+    const m = vids.find(f => f.itag === itag);
+    if (m) return m;
+  }
+  return vids.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
+}
+
+function pickBestAudioFormat(formats) {
+  const auds = formats.filter(f => f.mimeType?.startsWith('audio/') && f.url);
+  for (const itag of YT_AUDIO_ITAGS) {
+    const m = auds.find(f => f.itag === itag);
+    if (m) return m;
+  }
+  return auds.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
+}
+
+// Tier 1: ANDROID InnerTube client — returns direct URLs (no cipher needed)
+async function resolveYouTube(youtubeKey) {
+  if (!youtubeKey) return null;
+  try {
+    const playerRes = await fetchWithTimeout(
+      'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 13) gzip',
+          'X-YouTube-Client-Name': '3',
+          'X-YouTube-Client-Version': '19.29.37',
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: 'ANDROID',
+              clientVersion: '19.29.37',
+              androidSdkVersion: 33,
+              hl: 'en',
+              gl: 'US',
+            },
+          },
+          videoId: youtubeKey,
+          racyCheckOk: true,
+          contentCheckOk: true,
+        }),
+      },
+      8000
+    );
+    const data = await playerRes.json();
+    if (data.playabilityStatus?.status !== 'OK') return null;
+
+    // Try muxed formats first (video+audio in one stream, simpler for players)
+    const muxed = (data.streamingData?.formats || []).filter(f => f.url);
+    if (muxed.length > 0) {
+      // Prefer highest quality muxed (typically 720p H.264 max)
+      muxed.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+      const best = muxed[0];
+      const qualityLabel = best.qualityLabel || `${best.height || 360}p`;
+      return {
+        url: best.url,
+        provider: `YouTube ${qualityLabel}`,
+        bitrate: Math.round((best.bitrate || 0) / 1000),
+        width: best.width || 0,
+        height: best.height || 0
+      };
+    }
+
+    // Fallback: adaptive formats (video-only — audio separate)
+    const formats = data.streamingData?.adaptiveFormats || [];
+    const video = pickBestVideoFormat(formats);
+    if (!video?.url) return null;
+
+    const height = video.height || 0;
+    const width = video.width || 0;
+    const qualityLabel = video.qualityLabel || (height >= 2160 ? '4K' : height >= 1080 ? '1080p' : `${height}p`);
+    const codec = video.mimeType?.includes('avc1') ? 'H.264' : video.mimeType?.includes('vp9') ? 'VP9' : '';
+    const label = `YouTube ${qualityLabel}${codec ? ' ' + codec : ''}`;
+
+    return {
+      url: video.url,
+      provider: label,
+      bitrate: Math.round((video.bitrate || 0) / 1000),
+      width,
+      height
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 // ============== DAILYMOTION RESOLVER (shared utility) ==============
 
 async function resolveDailymotion(dmVideoId, providerLabel) {
@@ -646,7 +767,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v41:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v42:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -680,6 +801,15 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
   const sources = [
     // IMDb - needs nothing, starts immediately
     resolveIMDb(imdbId),
+
+    // YouTube - needs youtubeKeys from TMDB, tries ANDROID client (direct URLs)
+    (async () => {
+      const tmdbMeta = await tmdbReady.promise;
+      const keys = tmdbMeta?.youtubeKeys;
+      if (!keys?.length) return null;
+      // Try first key (best trailer from TMDB)
+      return resolveYouTube(keys[0]);
+    })(),
 
     // Plex - only needs actualType from TMDB, starts as soon as TMDB find completes
     (async () => {
