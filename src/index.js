@@ -509,6 +509,9 @@ async function getInnertube() {
   // Initialize QuickJS WASM once
   if (!_quickjs) _quickjs = await getQuickJSWASMModule();
 
+  // Fix Cloudflare Workers "Illegal invocation" — wrap fetch to preserve `this` binding
+  Platform.shim.fetch = (input, init) => fetch(input, init);
+
   // Set up custom eval shim — replaces blocked native eval()/new Function()
   // YouTube.js uses Platform.shim.eval(data, env) for sig/nsig deciphering
   Platform.shim.eval = async (data, env) => {
@@ -626,6 +629,7 @@ async function resolveYouTubeDebug(videoId) {
 
   // Stage 2: Innertube session
   try {
+    Platform.shim.fetch = (input, init) => fetch(input, init);
     Platform.shim.eval = async (data, env) => {
       const vm = _quickjs.newContext();
       try {
