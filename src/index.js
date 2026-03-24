@@ -714,9 +714,10 @@ async function resolveYouTube(youtubeKey) {
     const streamingData = info.streaming_data;
     if (!streamingData) return null;
 
-    // Try ADAPTIVE first — 1080p+ H.264 video (works on Fusion/AVFoundation)
+    // ADAPTIVE: MP4 only (AVFoundation can't play WebM/VP9)
+    // AV1 first (4K on M3+/A17 Pro+), H.264 fallback (1080p everywhere)
     const adaptiveRaw = (streamingData.adaptive_formats || [])
-      .filter(f => f.mime_type?.startsWith('video/'));
+      .filter(f => f.mime_type?.startsWith('video/mp4'));
     const adaptive = [];
     for (const f of adaptiveRaw) {
       try {
@@ -725,15 +726,16 @@ async function resolveYouTube(youtubeKey) {
       } catch { /* skip */ }
     }
     adaptive.sort((a, b) => {
-      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
-      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
-      if (aH264 !== bH264) return bH264 - aH264;
+      // AV1 (av01) = 2, H.264 (avc1) = 1, other = 0
+      const aScore = a.mime_type?.includes('av01') ? 2 : a.mime_type?.includes('avc1') ? 1 : 0;
+      const bScore = b.mime_type?.includes('av01') ? 2 : b.mime_type?.includes('avc1') ? 1 : 0;
+      if (aScore !== bScore) return bScore - aScore;
       return (b.height || 0) - (a.height || 0);
     });
 
     if (adaptive.length > 0) {
       const best = adaptive[0];
-      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('vp9') ? 'VP9' : '';
+      const codec = best.mime_type?.includes('av01') ? 'AV1' : best.mime_type?.includes('avc1') ? 'H.264' : '';
       return {
         url: best.url,
         provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
@@ -1071,7 +1073,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v47:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v48:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
