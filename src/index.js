@@ -29,7 +29,7 @@ function getManifest(lang) {
   const config = LANG_CONFIG[lang] || LANG_CONFIG.en;
   return {
     id: lang === 'en' ? 'io.trailerio.lite' : `io.trailerio.lite.${lang}`,
-    version: '1.4.0',
+    version: '1.5.0',
     name: lang === 'en' ? 'Trailerio' : `Trailerio ${config.label}`,
     description: lang === 'en'
       ? 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb'
@@ -580,8 +580,8 @@ async function getTvdbYouTubeKey(imdbId, lang = 'en') {
       || trailers.find(t => t.url?.includes('youtube'));
     if (!pick?.url) return null;
 
-    // Extract YouTube ID from URL
-    const match = pick.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+    // Extract YouTube ID from URL (handles watch?v=, /embed/, youtu.be/, /v/)
+    const match = pick.url.match(/(?:[?&]v=|\/(?:embed|v|shorts)\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
     return match ? match[1] : null;
   } catch { /* TVDB unavailable */ }
   return null;
@@ -1367,11 +1367,13 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v59:${lang}:${imdbId}`;
-  const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
-  if (cached) {
-    return await cached.json();
+async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) {
+  const cacheKey = `trailer:v60:${lang}:${imdbId}`;
+  if (!fresh) {
+    const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
+    if (cached) {
+      return await cached.json();
+    }
   }
 
   // Shared deferred signals - sources await these instead of blocking in phases
@@ -1474,6 +1476,12 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
     .filter(r => r.status === 'fulfilled')
     .map(r => r.value);
 
+  // Check if YouTube was expected but failed (cold-start / BotGuard timeout)
+  // sources[1] is the YouTube source (index 1 in settled = index 2)
+  const ytResult = settled[2]?.status === 'fulfilled' ? settled[2].value : null;
+  const hadYouTubeKeys = metaResult?.tmdbMeta?.youtubeKeys?.length > 0;
+  const youtubeFailed = hadYouTubeKeys && !ytResult;
+
   // Quality tier from largest dimension (aspect-ratio agnostic)
   const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
 
@@ -1505,8 +1513,10 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
   };
 
   if (links.length > 0) {
+    // If YouTube was expected but failed (cold-start), cache for only 5 minutes so it retries soon
+    const ttl = youtubeFailed ? 300 : CACHE_TTL;
     const response = new Response(JSON.stringify(result), {
-      headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
+      headers: { 'Cache-Control': `max-age=${ttl}` }
     });
     await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
   }
@@ -1560,13 +1570,14 @@ export default {
       return new Response(JSON.stringify(result, null, 2), { headers: corsHeaders });
     }
 
-    // Meta endpoint: /meta/{type}/{id}.json
+    // Meta endpoint: /meta/{type}/{id}.json  (?fresh=1 bypasses cache)
     const metaMatch = pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
     if (metaMatch) {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
+      const fresh = url.searchParams.has('fresh');
 
-      const result = await resolveTrailers(imdbId, type, cache, lang);
+      const result = await resolveTrailers(imdbId, type, cache, lang, fresh);
 
       return new Response(JSON.stringify({
         meta: {
