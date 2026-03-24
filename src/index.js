@@ -395,55 +395,24 @@ async function resolveFandango(imdbId, meta) {
     const fandangoId = meta?.wikidataIds?.fandangoId;
     if (!fandangoId) return null;
 
-    const title = meta?.title || '';
-    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
 
-    // Try multiple URL patterns (Fandango changed their URL structure)
-    const urls = [
-      `https://www.fandango.com/${slug}-${fandangoId}/movie-overview`,
+    const pageRes = await fetchWithTimeout(
       `https://www.fandango.com/x-${fandangoId}/movie-overview`,
-    ];
+      { headers, redirect: 'follow' }, 4000
+    );
+    if (!pageRes.ok) return null;
 
-    for (const url of urls) {
+    const html = await pageRes.text();
+
+    // Strategy 1: jwPlayerData (legacy)
+    const jwMatch = html.match(/jwPlayerData\s*=\s*(\{[\s\S]*?\});/);
+    if (jwMatch) {
       try {
-        const pageRes = await fetchWithTimeout(url, { headers, redirect: 'follow' });
-        if (!pageRes.ok) continue;
-
-        const html = await pageRes.text();
-
-        // Strategy 1: jwPlayerData (legacy)
-        const jwMatch = html.match(/jwPlayerData\s*=\s*(\{[\s\S]*?\});/);
-        if (jwMatch) {
-          try {
-            const jwData = JSON.parse(jwMatch[1]);
-            const contentURL = jwData.contentURL;
-            if (contentURL && contentURL.includes('theplatform.com')) {
-              const smilUrl = contentURL.split('?')[0] + '?format=SMIL&formats=mpeg4';
-              const smilRes = await fetchWithTimeout(smilUrl, { headers: { 'Accept': 'application/smil+xml' } }, 4000);
-              if (smilRes.ok) {
-                const smilXml = await smilRes.text();
-                const best = parseSMIL(smilXml);
-                if (best) {
-                  const quality = best.width >= 1900 ? '1080p' : `${best.height}p`;
-                  return { url: best.url, provider: `Fandango ${quality}`, bitrate: best.bitrate || 8000, width: best.width, height: best.height };
-                }
-              }
-            }
-          } catch { /* try next strategy */ }
-        }
-
-        // Strategy 2: Direct video.fandango.com MP4 URL in page
-        const fandangoMp4 = html.match(/https:\/\/video\.fandango\.com\/[^"'\s]+\.mp4/);
-        if (fandangoMp4) {
-          return { url: fandangoMp4[0], provider: 'Fandango 1080p', bitrate: 8000, width: 1920, height: 1080 };
-        }
-
-        // Strategy 3: theplatform.com URL in page (any context)
-        const tpMatch = html.match(/(https:\/\/link\.theplatform\.com\/s\/[^"'\s?]+)/);
-        if (tpMatch) {
-          const smilUrl = tpMatch[1] + '?format=SMIL&formats=mpeg4';
-          const smilRes = await fetchWithTimeout(smilUrl, { headers: { 'Accept': 'application/smil+xml' } }, 4000);
+        const jwData = JSON.parse(jwMatch[1]);
+        const contentURL = jwData.contentURL;
+        if (contentURL?.includes('theplatform.com')) {
+          const smilRes = await fetchWithTimeout(contentURL.split('?')[0] + '?format=SMIL&formats=mpeg4', { headers: { 'Accept': 'application/smil+xml' } }, 3000);
           if (smilRes.ok) {
             const best = parseSMIL(await smilRes.text());
             if (best) {
@@ -452,7 +421,26 @@ async function resolveFandango(imdbId, meta) {
             }
           }
         }
-      } catch { /* try next URL */ }
+      } catch { /* next strategy */ }
+    }
+
+    // Strategy 2: Direct video.fandango.com MP4 URL in page
+    const fandangoMp4 = html.match(/https:\/\/video\.fandango\.com\/[^"'\s]+\.mp4/);
+    if (fandangoMp4) {
+      return { url: fandangoMp4[0], provider: 'Fandango 1080p', bitrate: 8000, width: 1920, height: 1080 };
+    }
+
+    // Strategy 3: theplatform.com URL in page
+    const tpMatch = html.match(/(https:\/\/link\.theplatform\.com\/s\/[^"'\s?]+)/);
+    if (tpMatch) {
+      const smilRes = await fetchWithTimeout(tpMatch[1] + '?format=SMIL&formats=mpeg4', { headers: { 'Accept': 'application/smil+xml' } }, 3000);
+      if (smilRes.ok) {
+        const best = parseSMIL(await smilRes.text());
+        if (best) {
+          const quality = best.width >= 1900 ? '1080p' : `${best.height}p`;
+          return { url: best.url, provider: `Fandango ${quality}`, bitrate: best.bitrate || 8000, width: best.width, height: best.height };
+        }
+      }
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -467,46 +455,19 @@ async function resolveMUBI(imdbId, meta, lang = 'en') {
     const country = LANG_CONFIG[lang]?.mubiCountry || 'US';
     const profileOrder = { '1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240 };
 
-    // Strategy 1: Try API v3 with updated headers
-    try {
-      const res = await fetchWithTimeout(
-        `https://api.mubi.com/v3/films/${mubiId}`,
-        { headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json',
-          'Origin': 'https://mubi.com',
-          'Referer': 'https://mubi.com/',
-          'CLIENT': 'web',
-          'CLIENT_COUNTRY': country,
-        }}
-      );
-      if (res.ok) {
-        const data = await res.json();
-        const trailers = data.optimised_trailers;
-        if (trailers && trailers.length > 0) {
-          trailers.sort((a, b) => (profileOrder[b.profile] || 0) - (profileOrder[a.profile] || 0));
-          const best = trailers[0];
-          const height = profileOrder[best.profile] || 0;
-          return { url: best.url, provider: `MUBI ${best.profile}`, bitrate: 0, width: Math.round(height * 16 / 9), height, localized: lang !== 'en' };
-        }
-      }
-    } catch { /* try fallback */ }
-
-    // Strategy 2: Scrape MUBI website for trailer CDN URLs
-    // Try slug derived from TMDB title (lowercase, hyphenated)
+    // Scrape MUBI website for trailer CDN URLs (slug derived from TMDB title)
     const title = meta?.title;
     if (title) {
       const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       const pageRes = await fetchWithTimeout(
         `https://mubi.com/en/us/films/${slug}`,
-        { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
+        { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } },
+        4000
       );
       if (pageRes.ok) {
         const html = await pageRes.text();
-        // Extract trailer CDN URLs: trailers.mubicdn.net/[id]/optimised/[quality]-...mp4
         const trailerUrls = [...html.matchAll(/https:\/\/trailers\.mubicdn\.net\/\d+\/optimised\/(\d+)p[^"'\s]+\.mp4/g)];
         if (trailerUrls.length > 0) {
-          // Pick highest quality
           trailerUrls.sort((a, b) => parseInt(b[1]) - parseInt(a[1]));
           const bestUrl = trailerUrls[0][0];
           const height = parseInt(trailerUrls[0][1]) || 720;
@@ -530,72 +491,48 @@ const IMDB_GQL_HEADERS = {
 
 async function resolveIMDb(imdbId) {
   try {
-    // Step 1: Get first trailer video ID via GraphQL
+    // Step 1: Get first trailer video ID via GraphQL (4s timeout)
     const galleryQuery = {
-      query: `query TitleVideoGalleryPagination($const: ID!, $first: Int) {
-        title(id: $const) {
-          videoGallery(first: $first) {
-            edges {
-              node { id contentType { displayName { value } } }
-            }
-          }
-        }
-      }`,
-      operationName: 'TitleVideoGalleryPagination',
-      variables: { const: imdbId, first: 10 },
+      query: `query Q($c:ID!){title(id:$c){videoGallery(first:5){edges{node{id contentType{displayName{value}}}}}}}`,
+      operationName: 'Q',
+      variables: { c: imdbId },
     };
 
     const galleryRes = await fetchWithTimeout(
       'https://caching.graphql.imdb.com/',
-      { method: 'POST', headers: IMDB_GQL_HEADERS, body: JSON.stringify(galleryQuery) }
+      { method: 'POST', headers: IMDB_GQL_HEADERS, body: JSON.stringify(galleryQuery) },
+      4000
     );
     if (!galleryRes.ok) return null;
 
     const galleryData = await galleryRes.json();
     const edges = galleryData?.data?.title?.videoGallery?.edges || [];
-    // Prefer "Trailer" content type, fall back to first video
     const trailerEdge = edges.find(e => /trailer/i.test(e.node?.contentType?.displayName?.value)) || edges[0];
     if (!trailerEdge) return null;
 
-    const videoId = trailerEdge.node.id;
-
-    // Step 2: Get playback URLs for this video
+    // Step 2: Get playback URLs for this video (4s timeout)
     const playbackQuery = {
-      query: `query VideoPlaybackData($const: ID!) {
-        video(id: $const) {
-          playbackURLs {
-            displayName { value }
-            url
-            videoMimeType
-          }
-        }
-      }`,
-      operationName: 'VideoPlaybackData',
-      variables: { const: videoId },
+      query: `query Q($c:ID!){video(id:$c){playbackURLs{displayName{value}url videoMimeType}}}`,
+      operationName: 'Q',
+      variables: { c: trailerEdge.node.id },
     };
 
     const playbackRes = await fetchWithTimeout(
       'https://caching.graphql.imdb.com/',
-      { method: 'POST', headers: IMDB_GQL_HEADERS, body: JSON.stringify(playbackQuery) }
+      { method: 'POST', headers: IMDB_GQL_HEADERS, body: JSON.stringify(playbackQuery) },
+      4000
     );
     if (!playbackRes.ok) return null;
 
-    const playbackData = await playbackRes.json();
-    const urls = playbackData?.data?.video?.playbackURLs || [];
+    const urls = (await playbackRes.json())?.data?.video?.playbackURLs || [];
     if (urls.length === 0) return null;
 
-    // Pick best: prefer MP4 with highest quality label
-    const qualityOrder = ['1080p', '720p', '480p', '360p', '240p', 'SD'];
-    const mp4Urls = urls.filter(u => u.videoMimeType && u.videoMimeType.includes('mp4'));
-    const hlsUrls = urls.filter(u => u.url && (u.url.includes('.m3u8') || (u.videoMimeType && u.videoMimeType.includes('mpegURL'))));
-
-    // Prefer MP4 (direct URL, Fusion-compatible)
+    // Pick best MP4 (Fusion-compatible), fall back to any
+    const qualityOrder = ['1080p', '720p', '480p', '360p', 'SD'];
+    const mp4s = urls.filter(u => u.videoMimeType?.includes('mp4'));
     let best = null;
-    for (const q of qualityOrder) {
-      best = mp4Urls.find(u => u.displayName?.value?.includes(q));
-      if (best) break;
-    }
-    if (!best) best = mp4Urls[0] || hlsUrls[0] || urls[0];
+    for (const q of qualityOrder) { best = mp4s.find(u => u.displayName?.value?.includes(q)); if (best) break; }
+    if (!best) best = mp4s[0] || urls[0];
     if (!best?.url) return null;
 
     const quality = best.displayName?.value || '';
@@ -1478,7 +1415,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) {
-  const cacheKey = `trailer:v63:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v64:${lang}:${imdbId}`;
   if (!fresh) {
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
     if (cached) {
