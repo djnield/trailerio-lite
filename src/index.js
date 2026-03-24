@@ -610,6 +610,86 @@ async function resolveYouTube(youtubeKey) {
   }
 }
 
+// Debug: step-by-step YouTube resolution to identify failures
+async function resolveYouTubeDebug(videoId) {
+  const stages = { videoId, timestamp: new Date().toISOString() };
+  let yt;
+
+  // Stage 1: QuickJS WASM
+  try {
+    if (!_quickjs) _quickjs = await getQuickJSWASMModule();
+    stages.quickjs = 'ok';
+  } catch (e) {
+    stages.quickjs = `FAILED: ${e.message}`;
+    return stages;
+  }
+
+  // Stage 2: Innertube session
+  try {
+    Platform.shim.eval = async (data, env) => {
+      const vm = _quickjs.newContext();
+      try {
+        let code = '';
+        for (const [key, value] of Object.entries(env || {})) {
+          code += `var ${key} = ${JSON.stringify(value)};\n`;
+        }
+        code += data.output;
+        const result = vm.evalCode(code);
+        if (result.error) {
+          const err = vm.dump(result.error);
+          result.error.dispose();
+          throw new Error(`QuickJS: ${err}`);
+        }
+        const value = vm.dump(result.value);
+        result.value.dispose();
+        return value;
+      } finally { vm.dispose(); }
+    };
+    yt = await Innertube.create({ retrieve_player: true, generate_session_locally: true, enable_safety_mode: false });
+    stages.innertube = 'ok';
+    stages.player = yt.session?.player ? 'loaded' : 'missing';
+  } catch (e) {
+    stages.innertube = `FAILED: ${e.message}`;
+    return stages;
+  }
+
+  // Stage 3: getBasicInfo
+  let info;
+  try {
+    info = await yt.getBasicInfo(videoId);
+    stages.playability = info.playability_status?.status || 'unknown';
+    stages.reason = info.playability_status?.reason || null;
+    stages.muxedFormats = info.streaming_data?.formats?.length || 0;
+    stages.adaptiveFormats = info.streaming_data?.adaptive_formats?.length || 0;
+  } catch (e) {
+    stages.getBasicInfo = `FAILED: ${e.message}`;
+    return stages;
+  }
+
+  // Stage 4: decipher first format
+  if (info.streaming_data?.formats?.length > 0) {
+    try {
+      const f = info.streaming_data.formats[0];
+      const url = f.decipher(yt.session.player);
+      stages.decipherMuxed = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
+    } catch (e) {
+      stages.decipherMuxed = `FAILED: ${e.message}`;
+    }
+  }
+
+  if (info.streaming_data?.adaptive_formats?.length > 0) {
+    try {
+      const f = info.streaming_data.adaptive_formats[0];
+      const url = f.decipher(yt.session.player);
+      stages.decipherAdaptive = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
+    } catch (e) {
+      stages.decipherAdaptive = `FAILED: ${e.message}`;
+    }
+  }
+
+  return stages;
+}
+
 // ============== DAILYMOTION RESOLVER (shared utility) ==============
 
 async function resolveDailymotion(dmVideoId, providerLabel) {
@@ -778,7 +858,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v42:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v43:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -949,6 +1029,13 @@ export default {
     // Health check
     if (pathname === '/health') {
       return new Response(JSON.stringify({ status: 'ok', edge: request.cf?.colo, lang }), { headers: corsHeaders });
+    }
+
+    // YouTube debug endpoint
+    const ytDebugMatch = pathname.match(/^\/debug\/youtube\/(.+)$/);
+    if (ytDebugMatch) {
+      const result = await resolveYouTubeDebug(ytDebugMatch[1]);
+      return new Response(JSON.stringify(result, null, 2), { headers: corsHeaders });
     }
 
     // Meta endpoint: /meta/{type}/{id}.json
