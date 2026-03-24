@@ -697,7 +697,7 @@ async function getPoToken() {
     if (!_quickjs) _quickjs = await getQuickJSWASMModule();
     const qjsVm = _quickjs.newContext();
 
-    let botguardResponse;
+    let botguardResponse, poToken, estimatedTtlSecs;
     {
       // Build a self-contained script: mock DOM + interpreter + snapshot
       const mockDomCode = `
@@ -787,10 +787,10 @@ async function getPoToken() {
         body: JSON.stringify(itPayload),
       });
       const itJson = await itResponse.json();
-      const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = itJson;
+      const [integrityToken, estTtl, mintRefreshThreshold, websafeFallbackToken] = itJson;
+      estimatedTtlSecs = estTtl;
 
       // Step 3: Mint po_token INSIDE the same QuickJS context (minter function lives there)
-      let poToken;
       if (hasMinter && integrityToken) {
         // Decode integrityToken (base64url) to byte array in main context
         const b64 = integrityToken.replace(/-/g, '+').replace(/_/g, '/').replace(/\./g, '=');
