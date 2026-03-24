@@ -109,10 +109,12 @@ let _poTokenError = null;
 let _visitorData = null;
 
 async function getPoToken(db = null) {
+  // Return in-memory cached token if still valid (with 5 min buffer)
   if (_poToken && Date.now() < _poTokenExpiry - 300000) {
     return { poToken: _poToken, visitorData: _visitorData };
   }
 
+  // Check D1 for cached po_token (survives cold starts)
   const d1Cached = await d1Get(db, 'yt:potoken');
   if (d1Cached && d1Cached.expiry > Date.now()) {
     _poToken = d1Cached.poToken;
@@ -122,6 +124,7 @@ async function getPoToken(db = null) {
     return { poToken: _poToken, visitorData: _visitorData };
   }
 
+  // Generate fresh visitor_data
   if (!_visitorData) {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     let id = '';
@@ -129,12 +132,193 @@ async function getPoToken(db = null) {
     _visitorData = id;
   }
 
-  const coldToken = BG.PoToken.generateColdStartToken(_visitorData);
-  _poToken = coldToken;
-  _poTokenExpiry = Date.now() + 600000;
-  _poTokenType = 'cold-start';
-  d1Set(db, 'yt:potoken', { poToken: coldToken, visitorData: _visitorData, expiry: _poTokenExpiry, type: 'cold-start' }, 600);
-  return { poToken: coldToken, visitorData: _visitorData };
+  // Try full BotGuard minting (produces long-lived tokens ~1h)
+  try {
+    const bgEnv = createBotGuardEnv();
+    const bgConfig = {
+      fetch: (input, init) => fetch(input, init),
+      requestKey: 'O43z0dpjhgX20SCx4KAo',
+      globalObj: bgEnv,
+      identifier: _visitorData,
+      useYouTubeAPI: true,
+    };
+
+    const challenge = await BG.Challenge.create(bgConfig);
+
+    let interpreterScript = challenge.interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue;
+    if (!interpreterScript) {
+      const scriptUrl = challenge.interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+      if (!scriptUrl) throw new Error('No interpreter script in challenge');
+      const res = await fetch(scriptUrl);
+      interpreterScript = await res.text();
+    }
+
+    if (!_quickjs) _quickjs = await getQuickJSWASMModule();
+    const qjsVm = _quickjs.newContext();
+
+    let poToken, estimatedTtlSecs;
+    try {
+      const mockDomCode = `
+        var window = globalThis; var self = globalThis; var top = globalThis; var parent = globalThis;
+        var document = {
+          createElement: function() { return { style: {}, appendChild: function(c){return c}, removeChild: function(c){return c},
+            setAttribute: function(){}, getAttribute: function(){return null}, addEventListener: function(){},
+            removeEventListener: function(){}, getElementsByTagName: function(){return []},
+            querySelector: function(){return null}, querySelectorAll: function(){return []},
+            dispatchEvent: function(){return true}, remove: function(){},
+            innerHTML: '', textContent: '', offsetWidth: 1, offsetHeight: 1, dataset: {},
+            classList: {add:function(){},remove:function(){},contains:function(){return false}},
+            getBoundingClientRect: function(){return {top:0,left:0,bottom:0,right:0,width:1,height:1}} }},
+          createElementNS: function(){return document.createElement()},
+          createTextNode: function(){return document.createElement()},
+          getElementById: function(){return null}, querySelector: function(){return null},
+          querySelectorAll: function(){return []}, getElementsByTagName: function(){return []},
+          getElementsByClassName: function(){return []},
+          documentElement: {style:{}, getAttribute:function(){return null}},
+          head: {appendChild:function(c){return c}}, body: {appendChild:function(c){return c}},
+          cookie: '', addEventListener: function(){}, removeEventListener: function(){}
+        };
+        var navigator = {
+          userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          language: 'en-US', languages: ['en-US','en'], platform: 'MacIntel',
+          webdriver: false, plugins: {length:0}, mimeTypes: {length:0},
+          hardwareConcurrency: 8, maxTouchPoints: 0, connection: {effectiveType:'4g'}
+        };
+        var performance = {now: function(){return Date.now()}, mark:function(){}, measure:function(){}, getEntriesByName:function(){return []}};
+        var location = {href:'https://www.youtube.com', origin:'https://www.youtube.com', protocol:'https:', hostname:'www.youtube.com'};
+        var screen = {width:1920, height:1080, colorDepth:24};
+        var history = {length:1};
+        var crypto = {getRandomValues: function(a){for(var i=0;i<a.length;i++) a[i]=Math.floor(Math.random()*256);return a}};
+        var requestAnimationFrame = function(cb){return setTimeout(cb,16)};
+        var cancelAnimationFrame = function(id){clearTimeout(id)};
+        var getComputedStyle = function(){return new Proxy({},{get:function(){return ''}})};
+        var matchMedia = function(){return {matches:false,addListener:function(){},removeListener:function(){}}};
+        var MutationObserver = function(){this.observe=function(){};this.disconnect=function(){}};
+        var ResizeObserver = function(){this.observe=function(){};this.disconnect=function(){}};
+        var IntersectionObserver = function(){this.observe=function(){};this.disconnect=function(){}};
+        var HTMLElement = function(){}; var HTMLDivElement = function(){}; var HTMLScriptElement = function(){};
+        var Event = function(){this.preventDefault=function(){};this.stopPropagation=function(){}};
+        var CustomEvent = function(){}; var XMLHttpRequest = function(){this.open=function(){};this.send=function(){};this.setRequestHeader=function(){};this.addEventListener=function(){}};
+      `;
+
+      const program = challenge.program;
+      const globalName = challenge.globalName;
+      const snapshotCode = `
+        var __webPoSignalOutput = [];
+        var __syncSnapshot = null;
+        try {
+          var __vm = globalThis['${globalName}'];
+          if (__vm && __vm.a) {
+            __syncSnapshot = __vm.a(${JSON.stringify(program)}, function(asyncFn, shutdownFn, passFn, checkFn) {}, true, undefined, function(){}, [[], []])[0];
+          }
+        } catch(e) {}
+        var __bgResponse = '';
+        if (__syncSnapshot) {
+          try { __bgResponse = __syncSnapshot([undefined, undefined, __webPoSignalOutput, undefined]) || ''; } catch(e) {}
+        }
+        JSON.stringify({r: __bgResponse, hasMinter: typeof __webPoSignalOutput[0] === 'function'});
+      `;
+
+      const fullCode = mockDomCode + ';\n' + interpreterScript + ';\n' + snapshotCode;
+      const result = qjsVm.evalCode(fullCode);
+
+      if (result.error) {
+        const err = qjsVm.dump(result.error);
+        result.error.dispose();
+        throw new Error(`QuickJS BotGuard: ${JSON.stringify(err)}`);
+      }
+
+      const output = JSON.parse(qjsVm.dump(result.value));
+      result.value.dispose();
+      const botguardResponse = output.r;
+      const hasMinter = output.hasMinter;
+      if (!botguardResponse) throw new Error('BotGuard snapshot returned empty');
+
+      // Exchange botguardResponse for integrity token
+      const itPayload = [bgConfig.requestKey, botguardResponse];
+      const itResponse = await fetch('https://www.youtube.com/api/jnn/v1/GenerateIT', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json+protobuf', 'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw', 'x-user-agent': 'grpc-web-javascript/0.1', 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36(KHTML, like Gecko)' },
+        body: JSON.stringify(itPayload),
+      });
+      const itJson = await itResponse.json();
+      const [integrityToken, estTtl, , websafeFallbackToken] = itJson;
+      estimatedTtlSecs = estTtl;
+
+      // Mint po_token inside QuickJS context
+      if (hasMinter && integrityToken) {
+        const b64 = integrityToken.replace(/-/g, '+').replace(/_/g, '/').replace(/\./g, '=');
+        const raw = atob(b64);
+        const tokenBytes = [];
+        for (let i = 0; i < raw.length; i++) tokenBytes.push(raw.charCodeAt(i));
+        const idBytes = [];
+        for (let i = 0; i < _visitorData.length; i++) idBytes.push(_visitorData.charCodeAt(i));
+
+        const mintCode = `
+          (function() {
+            var getMinter = __webPoSignalOutput[0];
+            if (!getMinter) return JSON.stringify({err: 'no_minter'});
+            try {
+              var tokenBytes = new Uint8Array(${JSON.stringify(tokenBytes)});
+              var mintCb = getMinter(tokenBytes);
+              if (typeof mintCb === 'object' && mintCb && typeof mintCb.then === 'function') return JSON.stringify({err: 'async_minter'});
+              if (typeof mintCb !== 'function') return JSON.stringify({err: 'mintcb_type_' + typeof mintCb});
+              var idBytes = new Uint8Array(${JSON.stringify(idBytes)});
+              var result = mintCb(idBytes);
+              if (!result) return JSON.stringify({err: 'mint_null'});
+              var arr = [];
+              for (var i = 0; i < result.length; i++) arr.push(result[i]);
+              return JSON.stringify({ok: arr});
+            } catch(e) { return JSON.stringify({err: 'mint_error: ' + (e.message || e)}); }
+          })();
+        `;
+
+        const mintResult = qjsVm.evalCode(mintCode);
+        if (!mintResult.error) {
+          const mintOutput = JSON.parse(qjsVm.dump(mintResult.value));
+          mintResult.value.dispose();
+          if (mintOutput.ok) {
+            const bytes = String.fromCharCode(...mintOutput.ok);
+            poToken = btoa(bytes).replace(/\+/g, '-').replace(/\//g, '_');
+            _poTokenType = 'minted';
+          } else {
+            _poTokenError = mintOutput.err;
+            poToken = websafeFallbackToken || integrityToken;
+            _poTokenType = 'websafe-fallback';
+          }
+        } else {
+          const err = qjsVm.dump(mintResult.error);
+          mintResult.error.dispose();
+          _poTokenError = `mint_eval: ${JSON.stringify(err)}`;
+          poToken = websafeFallbackToken || integrityToken;
+          _poTokenType = 'websafe-fallback';
+        }
+      } else {
+        poToken = websafeFallbackToken || integrityToken;
+        _poTokenType = hasMinter ? 'websafe-fallback' : 'no-minter-fallback';
+      }
+
+    } finally {
+      qjsVm.dispose();
+    }
+
+    _poToken = poToken;
+    _poTokenExpiry = Date.now() + ((estimatedTtlSecs || 3600) * 1000);
+    if (_poTokenType === 'minted') _poTokenError = null;
+
+    // Cache minted token in D1 (survives instance recycling)
+    d1Set(db, 'yt:potoken', { poToken: _poToken, visitorData: _visitorData, expiry: _poTokenExpiry, type: _poTokenType }, Math.floor((_poTokenExpiry - Date.now()) / 1000));
+    return { poToken: _poToken, visitorData: _visitorData };
+  } catch (e) {
+    _poTokenError = e.message || String(e);
+    // Fallback: cold-start token (works for ~3 requests during SPS=2 grace period)
+    const coldToken = BG.PoToken.generateColdStartToken(_visitorData);
+    _poToken = coldToken;
+    _poTokenExpiry = Date.now() + 600000; // 10 min
+    _poTokenType = 'cold-start';
+    d1Set(db, 'yt:potoken', { poToken: coldToken, visitorData: _visitorData, expiry: _poTokenExpiry, type: 'cold-start' }, 600);
+    return { poToken: coldToken, visitorData: _visitorData };
+  }
 }
 
 // ============== YOUTUBE RESOLVER ==============
@@ -202,7 +386,7 @@ async function resolveYouTube(youtubeKey, db = null) {
       try {
         const info = await yt.getBasicInfo(youtubeKey, { client });
         if (info.playability_status?.status === 'LOGIN_REQUIRED') {
-          _poToken = null; _poTokenExpiry = 0; _innertube = null;
+          _poToken = null; _poTokenExpiry = 0; _visitorData = null; _innertube = null;
           continue;
         }
         if (info.playability_status?.status !== 'OK' || !info.streaming_data) continue;
