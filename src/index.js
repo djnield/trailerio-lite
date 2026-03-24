@@ -545,21 +545,11 @@ async function getInnertube() {
     }
   };
 
-  // Try fetching real session from YouTube (proper visitor_data, looks legitimate)
-  // Fall back to local generation if the network call fails
-  try {
-    _innertube = await Innertube.create({
-      retrieve_player: true,
-      generate_session_locally: false,
-      enable_safety_mode: false,
-    });
-  } catch {
-    _innertube = await Innertube.create({
-      retrieve_player: true,
-      generate_session_locally: true,
-      enable_safety_mode: false,
-    });
-  }
+  _innertube = await Innertube.create({
+    retrieve_player: true,
+    generate_session_locally: true,
+    enable_safety_mode: false,
+  });
   _innertubeRefresh = now;
   return _innertube;
 }
@@ -677,13 +667,7 @@ async function resolveYouTubeDebug(videoId) {
         return value;
       } finally { vm.dispose(); }
     };
-    try {
-      yt = await Innertube.create({ retrieve_player: true, generate_session_locally: false, enable_safety_mode: false });
-      stages.session = 'remote';
-    } catch {
-      yt = await Innertube.create({ retrieve_player: true, generate_session_locally: true, enable_safety_mode: false });
-      stages.session = 'local-fallback';
-    }
+    yt = await Innertube.create({ retrieve_player: true, generate_session_locally: true, enable_safety_mode: false });
     stages.innertube = 'ok';
     stages.player = yt.session?.player ? 'loaded' : 'missing';
   } catch (e) {
@@ -1066,15 +1050,16 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const cache = caches.default;
-
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
       'Content-Type': 'application/json'
     };
+
+    try {
+    const url = new URL(request.url);
+    const cache = caches.default;
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
@@ -1130,5 +1115,12 @@ export default {
       status: 404,
       headers: corsHeaders
     });
+
+    } catch (e) {
+      return new Response(JSON.stringify({ error: e.message || 'Internal error' }), {
+        status: 500,
+        headers: corsHeaders
+      });
+    }
   }
 };
