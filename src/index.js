@@ -837,19 +837,14 @@ const YOUTUBE_CLIENTS = ['IOS', 'ANDROID', 'WEB'];
 // Get URL from format — use direct URL if available, decipher only when needed
 async function getFormatUrl(f, player) {
   const raw = f.url || String(await f.decipher(player));
-  if (!raw) return null;
+  return raw || null;
+}
 
-  // Follow YouTube CDN redirect to get ipbypass URL (playable from any IP)
-  // Original URLs are IP-bound to the Worker's IP — end users can't play them
-  try {
-    const res = await fetch(raw, { method: 'HEAD', redirect: 'manual' });
-    const location = res.headers.get('location');
-    if (location && location.includes('ipbypass=yes')) {
-      return location;
-    }
-  } catch { /* fall through to raw URL */ }
-
-  return raw;
+// Encode a YouTube URL into a proxy path through our Worker
+// YouTube URLs are IP-bound — end users can't play them directly
+function makeProxyUrl(baseUrl, youtubeUrl) {
+  const encoded = encodeURIComponent(youtubeUrl);
+  return `${baseUrl}/proxy/yt?url=${encoded}`;
 }
 
 let _innertube = null;
@@ -949,6 +944,7 @@ async function resolveYouTube(youtubeKey) {
       const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('av01') ? 'AV1' : '';
       return {
         url: best.url,
+        needsProxy: true, // YouTube URLs are IP-bound, must proxy through Worker
         provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
         bitrate: Math.round((best.bitrate || 0) / 1000),
         width: best.width || 0,
@@ -971,6 +967,7 @@ async function resolveYouTube(youtubeKey) {
       const best = muxed[0];
       return {
         url: best.url,
+        needsProxy: true,
         provider: `YouTube ${best.quality_label || '360p'}`,
         bitrate: Math.round((best.bitrate || 0) / 1000),
         width: best.width || 0,
@@ -1294,8 +1291,8 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v52:${lang}:${imdbId}`;
+async function resolveTrailers(imdbId, type, cache, lang = 'en', baseUrl = '') {
+  const cacheKey = `trailer:v53:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -1422,7 +1419,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
       return true;
     })
     .map((r, index) => ({
-      trailers: r.url,
+      trailers: r.needsProxy && baseUrl ? makeProxyUrl(baseUrl, r.url) : r.url,
       provider: index === 0 ? `⭐ ${r.provider}` : r.provider
     }));
 
@@ -1487,13 +1484,38 @@ export default {
       return new Response(JSON.stringify(result, null, 2), { headers: corsHeaders });
     }
 
+    // YouTube video proxy — streams video through Worker to bypass IP-binding
+    if (pathname === '/proxy/yt') {
+      const ytUrl = url.searchParams.get('url');
+      if (!ytUrl || !ytUrl.includes('googlevideo.com/')) {
+        return new Response(JSON.stringify({ error: 'Invalid URL' }), { status: 400, headers: corsHeaders });
+      }
+      const videoRes = await fetch(ytUrl, {
+        headers: { 'User-Agent': 'com.google.ios.youtube/20.11.6 (iPhone10,4; U; CPU iOS 16_7_7 like Mac OS X)' },
+      });
+      if (!videoRes.ok) {
+        return new Response(JSON.stringify({ error: `YouTube returned ${videoRes.status}` }), { status: videoRes.status, headers: corsHeaders });
+      }
+      const proxyHeaders = new Headers(corsHeaders);
+      proxyHeaders.set('Content-Type', videoRes.headers.get('Content-Type') || 'video/mp4');
+      const cl = videoRes.headers.get('Content-Length');
+      if (cl) proxyHeaders.set('Content-Length', cl);
+      proxyHeaders.set('Accept-Ranges', 'bytes');
+      const cr = videoRes.headers.get('Content-Range');
+      if (cr) proxyHeaders.set('Content-Range', cr);
+      return new Response(videoRes.body, {
+        status: videoRes.status,
+        headers: proxyHeaders
+      });
+    }
+
     // Meta endpoint: /meta/{type}/{id}.json
     const metaMatch = pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
     if (metaMatch) {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const result = await resolveTrailers(imdbId, type, cache, lang);
+      const result = await resolveTrailers(imdbId, type, cache, lang, url.origin);
 
       return new Response(JSON.stringify({
         meta: {
