@@ -840,11 +840,7 @@ async function getFormatUrl(f, player) {
   return raw || null;
 }
 
-// Build a proxy URL that re-resolves YouTube on demand
-// YouTube URLs are IP-bound — we must resolve fresh per-request
-function makeProxyUrl(baseUrl, youtubeKey, format = '137') {
-  return `${baseUrl}/proxy/yt/${youtubeKey}/${format}`;
-}
+// YouTube URLs work from residential/mobile IPs — no proxy needed
 
 let _innertube = null;
 let _innertubeRefresh = 0;
@@ -943,9 +939,6 @@ async function resolveYouTube(youtubeKey) {
       const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('av01') ? 'AV1' : '';
       return {
         url: best.url,
-        needsProxy: true,
-        youtubeKey,
-        itag: best.itag || '137',
         provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
         bitrate: Math.round((best.bitrate || 0) / 1000),
         width: best.width || 0,
@@ -968,9 +961,6 @@ async function resolveYouTube(youtubeKey) {
       const best = muxed[0];
       return {
         url: best.url,
-        needsProxy: true,
-        youtubeKey,
-        itag: best.itag || '18',
         provider: `YouTube ${best.quality_label || '360p'}`,
         bitrate: Math.round((best.bitrate || 0) / 1000),
         width: best.width || 0,
@@ -1294,8 +1284,8 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function resolveTrailers(imdbId, type, cache, lang = 'en', baseUrl = '') {
-  const cacheKey = `trailer:v54:${lang}:${imdbId}`;
+async function resolveTrailers(imdbId, type, cache, lang = 'en') {
+  const cacheKey = `trailer:v55:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -1422,7 +1412,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', baseUrl = '') {
       return true;
     })
     .map((r, index) => ({
-      trailers: r.needsProxy && baseUrl ? makeProxyUrl(baseUrl, r.youtubeKey, String(r.itag)) : r.url,
+      trailers: r.url,
       provider: index === 0 ? `⭐ ${r.provider}` : r.provider
     }));
 
@@ -1487,66 +1477,13 @@ export default {
       return new Response(JSON.stringify(result, null, 2), { headers: corsHeaders });
     }
 
-    // YouTube video proxy — resolves fresh URL and streams to bypass IP-binding
-    const proxyMatch = pathname.match(/^\/proxy\/yt\/([a-zA-Z0-9_-]+)\/(\d+)$/);
-    if (proxyMatch) {
-      const [, videoId, itag] = proxyMatch;
-      try {
-        const yt = await getInnertube();
-        let info = null;
-        let lastErr = '';
-        for (const client of YOUTUBE_CLIENTS) {
-          try {
-            info = await yt.getBasicInfo(videoId, { client });
-            if (info?.playability_status?.status === 'OK' && info?.streaming_data) break;
-            info = null; // reset if not OK
-          } catch (e) { lastErr = `${client}: ${e.message}`; }
-        }
-        if (!info?.streaming_data) {
-          const status = info?.playability_status?.status || 'no-info';
-          const reason = info?.playability_status?.reason || lastErr || 'no streaming data';
-          return new Response(JSON.stringify({ error: `Video unavailable: ${status} - ${reason}`, poToken: _poTokenType }), { status: 404, headers: corsHeaders });
-        }
-
-        // Find the requested format by itag
-        const allFormats = [...(info.streaming_data.adaptive_formats || []), ...(info.streaming_data.formats || [])];
-        const format = allFormats.find(f => String(f.itag) === itag) || allFormats[0];
-        const videoUrl = await getFormatUrl(format, yt.session.player);
-        if (!videoUrl) {
-          return new Response(JSON.stringify({ error: 'No URL for format' }), { status: 404, headers: corsHeaders });
-        }
-
-        // Pass through Range header for seeking
-        const fetchHeaders = {};
-        const range = request.headers.get('Range');
-        if (range) fetchHeaders['Range'] = range;
-
-        const videoRes = await fetch(videoUrl, { headers: fetchHeaders, redirect: 'follow' });
-        if (!videoRes.ok && videoRes.status !== 206) {
-          return new Response(JSON.stringify({ error: `YouTube ${videoRes.status}` }), { status: videoRes.status, headers: corsHeaders });
-        }
-
-        const proxyHeaders = new Headers(corsHeaders);
-        proxyHeaders.set('Content-Type', videoRes.headers.get('Content-Type') || 'video/mp4');
-        const cl = videoRes.headers.get('Content-Length');
-        if (cl) proxyHeaders.set('Content-Length', cl);
-        proxyHeaders.set('Accept-Ranges', 'bytes');
-        const cr = videoRes.headers.get('Content-Range');
-        if (cr) proxyHeaders.set('Content-Range', cr);
-
-        return new Response(videoRes.body, { status: videoRes.status, headers: proxyHeaders });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
-      }
-    }
-
     // Meta endpoint: /meta/{type}/{id}.json
     const metaMatch = pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
     if (metaMatch) {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const result = await resolveTrailers(imdbId, type, cache, lang, url.origin);
+      const result = await resolveTrailers(imdbId, type, cache, lang);
 
       return new Response(JSON.stringify({
         meta: {
