@@ -560,6 +560,8 @@ function createBotGuardEnv() {
 
 let _poToken = null;
 let _poTokenExpiry = 0;
+let _poTokenType = 'none'; // 'full', 'cold-start', or 'none'
+let _poTokenError = null;
 let _visitorData = null;
 
 async function getPoToken() {
@@ -613,14 +615,18 @@ async function getPoToken() {
 
     _poToken = poToken;
     _poTokenExpiry = Date.now() + ((integrityTokenData.estimatedTtlSecs || 3600) * 1000);
+    _poTokenType = 'full';
+    _poTokenError = null;
 
     return { poToken: _poToken, visitorData: _visitorData };
   } catch (e) {
+    _poTokenError = e.message || String(e);
     // Fallback: cold-start token (works during SPS=2 grace period)
     if (_visitorData) {
       const coldToken = BG.PoToken.generateColdStartToken(_visitorData);
       _poToken = coldToken;
       _poTokenExpiry = Date.now() + 600000; // 10 min for cold-start
+      _poTokenType = 'cold-start';
       return { poToken: coldToken, visitorData: _visitorData };
     }
     return { poToken: null, visitorData: null };
@@ -715,7 +721,7 @@ async function resolveYouTube(youtubeKey) {
     if (!streamingData) return null;
 
     // ADAPTIVE: MP4 only (AVFoundation can't play WebM/VP9)
-    // AV1 first (4K on M3+/A17 Pro+), H.264 fallback (1080p everywhere)
+    // H.264 first (1080p, plays everywhere), then by resolution
     const adaptiveRaw = (streamingData.adaptive_formats || [])
       .filter(f => f.mime_type?.startsWith('video/mp4'));
     const adaptive = [];
@@ -726,16 +732,15 @@ async function resolveYouTube(youtubeKey) {
       } catch { /* skip */ }
     }
     adaptive.sort((a, b) => {
-      // AV1 (av01) = 2, H.264 (avc1) = 1, other = 0
-      const aScore = a.mime_type?.includes('av01') ? 2 : a.mime_type?.includes('avc1') ? 1 : 0;
-      const bScore = b.mime_type?.includes('av01') ? 2 : b.mime_type?.includes('avc1') ? 1 : 0;
-      if (aScore !== bScore) return bScore - aScore;
+      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
+      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
+      if (aH264 !== bH264) return bH264 - aH264;
       return (b.height || 0) - (a.height || 0);
     });
 
     if (adaptive.length > 0) {
       const best = adaptive[0];
-      const codec = best.mime_type?.includes('av01') ? 'AV1' : best.mime_type?.includes('avc1') ? 'H.264' : '';
+      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('av01') ? 'AV1' : '';
       return {
         url: best.url,
         provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
@@ -816,7 +821,11 @@ async function resolveYouTubeDebug(videoId) {
     yt = await Innertube.create(debugOpts);
     stages.innertube = 'ok';
     stages.player = yt.session?.player ? 'loaded' : 'missing';
-    stages.poToken = debugPot ? `valid (expires ${new Date(_poTokenExpiry).toISOString()})` : 'cold-start';
+    stages.poToken = {
+      type: _poTokenType,
+      expires: _poTokenExpiry ? new Date(_poTokenExpiry).toISOString() : null,
+      error: _poTokenError,
+    };
   } catch (e) {
     stages.innertube = `FAILED: ${e.message}`;
     return stages;
@@ -1073,7 +1082,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v48:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v49:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
