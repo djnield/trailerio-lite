@@ -81,7 +81,7 @@ function parseSMIL(smilXml) {
 
 // ============== TMDB METADATA ==============
 
-async function getTMDBMetadata(imdbId, type = 'movie') {
+async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en') {
   try {
     const findRes = await fetchWithTimeout(
       `https://api.themoviedb.org/3/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`
@@ -112,7 +112,7 @@ async function getTMDBMetadata(imdbId, type = 'movie') {
     const [extData, videosData] = await Promise.all([
       fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`)
         .then(r => r.json()).catch(() => ({})),
-      fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/videos?api_key=${TMDB_API_KEY}&language=en-US`)
+      fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/videos?api_key=${TMDB_API_KEY}&language=${lang}&include_video_language=${lang},en,ja,null`)
         .then(r => r.json()).catch(() => ({ results: [] }))
     ]);
 
@@ -165,7 +165,9 @@ async function getWikidataIds(wikidataId) {
       // Webedia network (AlloCiné ID also works on SensaCine + Beyazperde)
       allocineId: entity.claims?.P1265?.[0]?.mainsnak?.datavalue?.value,
       filmstartsId: entity.claims?.P8531?.[0]?.mainsnak?.datavalue?.value,
-      adoroCinemaId: entity.claims?.P7777?.[0]?.mainsnak?.datavalue?.value
+      adoroCinemaId: entity.claims?.P7777?.[0]?.mainsnak?.datavalue?.value,
+      // Anime IDs for AniList trailer fallback
+      malId: entity.claims?.P4086?.[0]?.mainsnak?.datavalue?.value,
     };
   } catch (e) {
     return {};
@@ -493,6 +495,26 @@ async function resolveIMDb(imdbId) {
       return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, width: 0, height: 0 };
     }
   } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// ============== ANILIST TRAILER FALLBACK (for anime) ==============
+
+async function getAniListYouTubeKey(malId) {
+  if (!malId) return null;
+  try {
+    const query = 'query($id:Int){Media(idMal:$id,type:ANIME){trailer{id site}}}';
+    const res = await fetchWithTimeout('https://graphql.anilist.co', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ query, variables: { id: parseInt(malId) } })
+    }, 5000);
+    const data = await res.json();
+    const trailer = data?.data?.Media?.trailer;
+    if (trailer?.site === 'youtube' && trailer?.id) {
+      return trailer.id.trim(); // AniList sometimes has trailing whitespace
+    }
+  } catch { /* AniList unavailable */ }
   return null;
 }
 
@@ -1174,7 +1196,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v49:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v50:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -1188,7 +1210,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
   // TMDB find → external_ids → Wikidata: chained but non-blocking to sources
   const metaPipeline = (async () => {
     try {
-      const tmdbMeta = await getTMDBMetadata(imdbId, type);
+      const tmdbMeta = await getTMDBMetadata(imdbId, type, lang);
       tmdbReady.resolve(tmdbMeta);  // unblocks Plex immediately
 
       const wikidataIds = tmdbMeta?.wikidataId
@@ -1209,13 +1231,18 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
     // IMDb - needs nothing, starts immediately
     resolveIMDb(imdbId),
 
-    // YouTube - needs youtubeKeys from TMDB, tries ANDROID client (direct URLs)
+    // YouTube - tries TMDB keys first, falls back to AniList for anime
     (async () => {
       const tmdbMeta = await tmdbReady.promise;
       const keys = tmdbMeta?.youtubeKeys;
-      if (!keys?.length) return null;
-      // Try first key (best trailer from TMDB)
-      return resolveYouTube(keys[0]);
+      if (keys?.length) return resolveYouTube(keys[0]);
+
+      // AniList fallback: get MAL ID from Wikidata, query AniList for trailer
+      const { wikidataIds } = await metaReady.promise;
+      const aniListKey = await getAniListYouTubeKey(wikidataIds?.malId);
+      if (aniListKey) return resolveYouTube(aniListKey);
+
+      return null;
     })(),
 
     // Plex - only needs actualType from TMDB, starts as soon as TMDB find completes
