@@ -497,6 +497,8 @@ async function resolveIMDb(imdbId) {
 // ============== YOUTUBE RESOLVER ==============
 
 // Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
+// TV_EMBEDDED and ANDROID clients are less likely to be blocked from datacenter IPs
+const YOUTUBE_CLIENTS = ['TV_EMBEDDED', 'ANDROID', 'WEB'];
 let _innertube = null;
 let _innertubeRefresh = 0;
 let _quickjs = null;
@@ -549,9 +551,17 @@ async function resolveYouTube(youtubeKey) {
   if (!youtubeKey) return null;
   try {
     const yt = await getInnertube();
-    const info = await yt.getBasicInfo(youtubeKey);
 
-    if (info.playability_status?.status !== 'OK') return null;
+    // Try multiple client types — datacenter IPs get blocked on WEB but not TV/mobile
+    let info = null;
+    for (const client of YOUTUBE_CLIENTS) {
+      try {
+        info = await yt.getBasicInfo(youtubeKey, { client });
+        if (info.playability_status?.status === 'OK' && info.streaming_data) break;
+      } catch { /* try next client */ }
+    }
+
+    if (!info || info.playability_status?.status !== 'OK') return null;
 
     const streamingData = info.streaming_data;
     if (!streamingData) return null;
@@ -657,20 +667,35 @@ async function resolveYouTubeDebug(videoId) {
     return stages;
   }
 
-  // Stage 3: getBasicInfo
-  let info;
-  try {
-    info = await yt.getBasicInfo(videoId);
-    stages.playability = info.playability_status?.status || 'unknown';
-    stages.reason = info.playability_status?.reason || null;
-    stages.muxedFormats = info.streaming_data?.formats?.length || 0;
-    stages.adaptiveFormats = info.streaming_data?.adaptive_formats?.length || 0;
-  } catch (e) {
-    stages.getBasicInfo = `FAILED: ${e.message}`;
-    return stages;
+  // Stage 3: getBasicInfo — try each client type
+  let info = null;
+  let usedClient = null;
+  stages.clients = {};
+  for (const client of YOUTUBE_CLIENTS) {
+    try {
+      const result = await yt.getBasicInfo(videoId, { client });
+      stages.clients[client] = {
+        playability: result.playability_status?.status || 'unknown',
+        reason: result.playability_status?.reason || null,
+        muxedFormats: result.streaming_data?.formats?.length || 0,
+        adaptiveFormats: result.streaming_data?.adaptive_formats?.length || 0
+      };
+      if (result.playability_status?.status === 'OK' && result.streaming_data) {
+        info = result;
+        usedClient = client;
+      }
+    } catch (e) {
+      stages.clients[client] = { error: e.message };
+    }
   }
 
-  // Stage 4: decipher first format
+  if (!info) {
+    stages.bestClient = 'none';
+    return stages;
+  }
+  stages.bestClient = usedClient;
+
+  // Stage 4: decipher first format using the working client's data
   if (info.streaming_data?.formats?.length > 0) {
     try {
       const f = info.streaming_data.formats[0];
