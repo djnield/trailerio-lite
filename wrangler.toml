@@ -6,4 +6,4 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "trailerio-cache"
-database_id = "placeholder"
+database_id = "4e88de1b-0473-4078-9edb-437989ab33e9"
