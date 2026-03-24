@@ -11,7 +11,7 @@ const LANG_CONFIG = {
   en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
   fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|VOSTFR/i },
   de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'], dubbedRe: /\bDF\b|deutsch/i, originalRe: /\bOV\b|\bOmU\b/i },
-  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano' },
+  it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano', localSources: ['mymovies', 'movieplayer'], dubbedRe: /italiano|\bita\b/i, originalRe: /\bVO\b|\bOV\b|originale|sottotitol/i },
   es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'] },
   pt: { appleCountry: 'br', mubiCountry: 'BR', label: 'Português', localSources: ['adorocinema'], dubbedRe: /dublad/i, originalRe: /original|legendad/i },
   ru: { appleCountry: 'ru', mubiCountry: 'RU', label: 'Русский' },
@@ -169,6 +169,10 @@ async function getWikidataIds(wikidataId) {
       adoroCinemaId: entity.claims?.P7777?.[0]?.mainsnak?.datavalue?.value,
       // Anime IDs for AniList trailer fallback
       malId: entity.claims?.P4086?.[0]?.mainsnak?.datavalue?.value,
+      // Italian sources
+      mymoviesId: entity.claims?.P4780?.[0]?.mainsnak?.datavalue?.value,
+      movieplayerFilmId: entity.claims?.P4783?.[0]?.mainsnak?.datavalue?.value,
+      movieplayerSeriesId: entity.claims?.P4784?.[0]?.mainsnak?.datavalue?.value,
     };
   } catch (e) {
     return {};
@@ -1306,6 +1310,62 @@ function resolveAdoroCinema(meta) {
   );
 }
 
+// 12. MYmovies.it (Italian) - ID-based iframe scraping
+async function resolveMYMovies(meta) {
+  const id = meta?.wikidataIds?.mymoviesId;
+  if (!id) return null;
+  try {
+    const iframeRes = await fetchWithTimeout(
+      `https://www.mymovies.it/video/iframe/?idfilm=${id}&ajax=true&adv=true`,
+      { headers: UA }
+    );
+    if (!iframeRes.ok) return null;
+    const html = await iframeRes.text();
+    // Path A: Direct MP4 source (Flowplayer format)
+    const srcMatch = html.match(/src:\s*'(https?:\/\/[^']+\.mp4[^']*)'/);
+    if (srcMatch) {
+      return { url: srcMatch[1], provider: 'MYmovies', bitrate: 0, width: 0, height: 1080, localized: true };
+    }
+    // Path B: Dailymotion video ID embedded in player
+    const dmMatch = html.match(/(?:dailymotion\.com\/(?:embed\/)?video\/|video_id["':\s]+["']?)([a-zA-Z0-9]+)/);
+    if (dmMatch) {
+      const result = await resolveDailymotion(dmMatch[1], 'MYmovies');
+      if (result) return { ...result, localized: true };
+    }
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// 13. Movieplayer.it (Italian) - ID-based page scraping
+async function resolveMovieplayer(meta) {
+  const filmId = meta?.wikidataIds?.movieplayerFilmId;
+  const seriesId = meta?.wikidataIds?.movieplayerSeriesId;
+  const id = filmId || seriesId;
+  const pathType = filmId ? 'film' : 'serie-tv';
+  if (!id) return null;
+  try {
+    const pageRes = await fetchWithTimeout(
+      `https://movieplayer.it/${pathType}/_${id}/video/`,
+      { headers: UA }
+    );
+    if (!pageRes.ok) return null;
+    const html = await pageRes.text();
+    // Extract YouTube video ID from embed
+    const ytMatch = html.match(/(?:youtube\.com\/(?:embed|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+    if (ytMatch) {
+      const result = await resolveYouTube(ytMatch[1]);
+      if (result) return { ...result, provider: 'Movieplayer', localized: true };
+    }
+    // Extract Dailymotion video ID
+    const dmMatch = html.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/);
+    if (dmMatch) {
+      const result = await resolveDailymotion(dmMatch[1], 'Movieplayer');
+      if (result) return { ...result, localized: true };
+    }
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
 // ============== MAIN RESOLVER ==============
 
 // Deferred promise: lets downstream consumers await a value that upstream will resolve later
@@ -1316,7 +1376,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) {
-  const cacheKey = `trailer:v61:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v62:${lang}:${imdbId}`;
   if (!fresh) {
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
     if (cached) {
@@ -1415,6 +1475,14 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false) 
   if (localSources.includes('adorocinema')) sources.push((async () => {
     const { tmdbMeta, wikidataIds } = await metaReady.promise;
     return resolveAdoroCinema({ ...tmdbMeta, wikidataIds });
+  })());
+  if (localSources.includes('mymovies')) sources.push((async () => {
+    const { tmdbMeta, wikidataIds } = await metaReady.promise;
+    return resolveMYMovies({ ...tmdbMeta, wikidataIds });
+  })());
+  if (localSources.includes('movieplayer')) sources.push((async () => {
+    const { tmdbMeta, wikidataIds } = await metaReady.promise;
+    return resolveMovieplayer({ ...tmdbMeta, wikidataIds });
   })());
 
   // Wait for everything - allSettled so one source crash doesn't kill others
