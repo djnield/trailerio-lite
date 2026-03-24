@@ -526,15 +526,17 @@ let _tvdbTokenExpiry = 0;
 
 async function getTvdbToken() {
   if (_tvdbToken && Date.now() < _tvdbTokenExpiry) return _tvdbToken;
-  const res = await fetchWithTimeout('https://api4.thetvdb.com/v4/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apikey: TVDB_API_KEY })
-  }, 5000);
-  const data = await res.json();
-  _tvdbToken = data?.data?.token;
-  _tvdbTokenExpiry = Date.now() + 23 * 60 * 60 * 1000; // ~23 hours
-  return _tvdbToken;
+  try {
+    const res = await fetchWithTimeout('https://api4.thetvdb.com/v4/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apikey: TVDB_API_KEY })
+    }, 5000);
+    const data = await res.json();
+    _tvdbToken = data?.data?.token;
+    _tvdbTokenExpiry = Date.now() + 23 * 60 * 60 * 1000; // ~23 hours
+    return _tvdbToken;
+  } catch { return null; }
 }
 
 async function getTvdbYouTubeKey(imdbId, lang = 'en') {
@@ -1298,22 +1300,24 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en') {
     // IMDb - needs nothing, starts immediately
     resolveIMDb(imdbId),
 
-    // YouTube - tries TMDB keys first, falls back to AniList for anime
+    // YouTube - tries TMDB keys first, falls back to AniList + TVDB in parallel
     (async () => {
-      const tmdbMeta = await tmdbReady.promise;
-      const keys = tmdbMeta?.youtubeKeys;
-      if (keys?.length) return resolveYouTube(keys[0]);
+      try {
+        const tmdbMeta = await tmdbReady.promise;
+        const keys = tmdbMeta?.youtubeKeys;
+        if (keys?.length) return resolveYouTube(keys[0]);
 
-      // AniList fallback: get MAL ID from Wikidata, query AniList for trailer
-      const { wikidataIds } = await metaReady.promise;
-      const aniListKey = await getAniListYouTubeKey(wikidataIds?.malId);
-      if (aniListKey) return resolveYouTube(aniListKey);
+        // No TMDB keys — try AniList + TVDB in parallel (first one wins)
+        const { wikidataIds } = await metaReady.promise;
+        const [aniListKey, tvdbKey] = await Promise.all([
+          getAniListYouTubeKey(wikidataIds?.malId).catch(() => null),
+          getTvdbYouTubeKey(imdbId, lang).catch(() => null),
+        ]);
+        const ytKey = aniListKey || tvdbKey;
+        if (ytKey) return resolveYouTube(ytKey);
 
-      // TVDB fallback: search by IMDb ID, get trailers (localized)
-      const tvdbKey = await getTvdbYouTubeKey(imdbId, lang);
-      if (tvdbKey) return resolveYouTube(tvdbKey);
-
-      return null;
+        return null;
+      } catch { return null; }
     })(),
 
     // Plex - only needs actualType from TMDB, starts as soon as TMDB find completes
