@@ -836,8 +836,20 @@ const YOUTUBE_CLIENTS = ['IOS', 'ANDROID', 'WEB'];
 
 // Get URL from format — use direct URL if available, decipher only when needed
 async function getFormatUrl(f, player) {
-  if (f.url) return f.url;
-  return String(await f.decipher(player));
+  const raw = f.url || String(await f.decipher(player));
+  if (!raw) return null;
+
+  // Follow YouTube CDN redirect to get ipbypass URL (playable from any IP)
+  // Original URLs are IP-bound to the Worker's IP — end users can't play them
+  try {
+    const res = await fetch(raw, { method: 'HEAD', redirect: 'manual' });
+    const location = res.headers.get('location');
+    if (location && location.includes('ipbypass=yes')) {
+      return location;
+    }
+  } catch { /* fall through to raw URL */ }
+
+  return raw;
 }
 
 let _innertube = null;
@@ -1283,7 +1295,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v51:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v52:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
