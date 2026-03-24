@@ -852,6 +852,21 @@ async function resolveYouTubeDebug(videoId) {
   }
   stages.bestClient = usedClient;
 
+  // List ALL adaptive video formats for 4K research
+  const allAdaptive = (info.streaming_data?.adaptive_formats || [])
+    .filter(f => f.mime_type?.startsWith('video/'))
+    .sort((a, b) => (b.height || 0) - (a.height || 0))
+    .map(f => ({
+      itag: f.itag,
+      quality: f.quality_label,
+      codec: f.mime_type?.split(';')[0],
+      codecs: f.mime_type?.match(/codecs="([^"]+)"/)?.[1] || '',
+      width: f.width, height: f.height,
+      bitrate: Math.round((f.bitrate || 0) / 1000) + 'kbps',
+      hasUrl: !!f.url,
+    }));
+  stages.allFormats = allAdaptive;
+
   // Stage 4: test best adaptive format (what the resolver actually uses)
   const adaptiveVideo = (info.streaming_data?.adaptive_formats || [])
     .filter(f => f.mime_type?.startsWith('video/'))
@@ -1056,7 +1071,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v46:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v47:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
