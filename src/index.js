@@ -947,74 +947,98 @@ async function getInnertube() {
   return _innertube;
 }
 
+// Parse HLS master playlist to find best quality stream
+function parseHlsBestQuality(masterPlaylist) {
+  const lines = masterPlaylist.split('\n');
+  let bestBandwidth = 0;
+  let bestRes = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF:')) continue;
+    const bwMatch = line.match(/BANDWIDTH=(\d+)/);
+    const resMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
+    const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
+    if (bandwidth > bestBandwidth) {
+      bestBandwidth = bandwidth;
+      bestRes = resMatch ? { width: parseInt(resMatch[1]), height: parseInt(resMatch[2]) } : null;
+    }
+  }
+
+  return bestBandwidth > 0 ? { bandwidth: bestBandwidth, ...bestRes } : null;
+}
+
 async function resolveYouTube(youtubeKey) {
   if (!youtubeKey) return null;
   try {
     const yt = await getInnertube();
 
-    // Try multiple client types — datacenter IPs get blocked on WEB but not TV/mobile
-    let info = null;
+    // Try all clients, collect best result from each
+    // Priority: HLS (1080p, video+audio) → muxed MP4 (720p, video+audio) → skip adaptive (video-only)
+    let bestHls = null;
+    let bestMuxed = null;
+
     for (const client of YOUTUBE_CLIENTS) {
       try {
-        info = await yt.getBasicInfo(youtubeKey, { client });
-        if (info.playability_status?.status === 'OK' && info.streaming_data) break;
+        const info = await yt.getBasicInfo(youtubeKey, { client });
+        if (info.playability_status?.status !== 'OK' || !info.streaming_data) continue;
+        const sd = info.streaming_data;
+
+        // Check for HLS manifest (IOS client returns this — combined video+audio up to 1080p)
+        if (!bestHls && sd.hls_manifest_url) {
+          try {
+            const hlsRes = await fetch(sd.hls_manifest_url);
+            if (hlsRes.ok) {
+              const masterText = await hlsRes.text();
+              const best = parseHlsBestQuality(masterText);
+              if (best) {
+                bestHls = {
+                  url: sd.hls_manifest_url,
+                  height: best.height || 1080,
+                  width: best.width || 0,
+                  bandwidth: best.bandwidth,
+                };
+              }
+            }
+          } catch { /* HLS fetch failed */ }
+        }
+
+        // Check for muxed formats (video+audio combined — plays everywhere)
+        if (!bestMuxed) {
+          const muxedRaw = sd.formats || [];
+          for (const f of muxedRaw) {
+            try {
+              const url = await getFormatUrl(f, yt.session.player);
+              if (url && (!bestMuxed || (f.height || 0) > bestMuxed.height)) {
+                bestMuxed = { url, height: f.height || 0, width: f.width || 0, bitrate: f.bitrate || 0, quality_label: f.quality_label };
+              }
+            } catch { /* skip */ }
+          }
+        }
+
+        // If we have HLS, no need to try more clients
+        if (bestHls) break;
       } catch { /* try next client */ }
     }
 
-    if (!info || info.playability_status?.status !== 'OK') return null;
-
-    const streamingData = info.streaming_data;
-    if (!streamingData) return null;
-
-    // ADAPTIVE: MP4 only (AVFoundation can't play WebM/VP9)
-    // H.264 first (1080p, plays everywhere), then by resolution
-    const adaptiveRaw = (streamingData.adaptive_formats || [])
-      .filter(f => f.mime_type?.startsWith('video/mp4'));
-    const adaptive = [];
-    for (const f of adaptiveRaw) {
-      try {
-        const url = await getFormatUrl(f, yt.session.player);
-        if (url) adaptive.push({ ...f, url });
-      } catch { /* skip */ }
-    }
-    adaptive.sort((a, b) => {
-      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
-      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
-      if (aH264 !== bH264) return bH264 - aH264;
-      return (b.height || 0) - (a.height || 0);
-    });
-
-    if (adaptive.length > 0) {
-      const best = adaptive[0];
-      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('av01') ? 'AV1' : '';
+    // Return best available: HLS > muxed
+    if (bestHls) {
       return {
-        url: best.url,
-        provider: `YouTube ${best.quality_label || '720p'}${codec ? ' ' + codec : ''}`,
-        bitrate: Math.round((best.bitrate || 0) / 1000),
-        width: best.width || 0,
-        height: best.height || 0
+        url: bestHls.url,
+        provider: `YouTube ${bestHls.height}p`,
+        bitrate: Math.round((bestHls.bandwidth || 0) / 1000),
+        width: bestHls.width,
+        height: bestHls.height,
       };
     }
 
-    // Fallback: muxed formats (video+audio, 720p max from WEB, 360p from ANDROID)
-    const muxedRaw = streamingData.formats || [];
-    const muxed = [];
-    for (const f of muxedRaw) {
-      try {
-        const url = await getFormatUrl(f, yt.session.player);
-        if (url) muxed.push({ ...f, url });
-      } catch { /* skip */ }
-    }
-    muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
-
-    if (muxed.length > 0) {
-      const best = muxed[0];
+    if (bestMuxed) {
       return {
-        url: best.url,
-        provider: `YouTube ${best.quality_label || '360p'}`,
-        bitrate: Math.round((best.bitrate || 0) / 1000),
-        width: best.width || 0,
-        height: best.height || 0
+        url: bestMuxed.url,
+        provider: `YouTube ${bestMuxed.quality_label || bestMuxed.height + 'p'}`,
+        bitrate: Math.round((bestMuxed.bitrate || 0) / 1000),
+        width: bestMuxed.width,
+        height: bestMuxed.height,
       };
     }
 
@@ -1097,6 +1121,7 @@ async function resolveYouTubeDebug(videoId) {
       stages.clients[client] = {
         playability: result.playability_status?.status || 'unknown',
         reason: result.playability_status?.reason || null,
+        hlsManifestUrl: result.streaming_data?.hls_manifest_url ? 'yes' : 'no',
         muxedFormats: result.streaming_data?.formats?.length || 0,
         adaptiveFormats: adaptiveVideo.length,
         bestAdaptive: bestAdaptive ? `${bestAdaptive.quality_label} ${bestAdaptive.mime_type?.split(';')[0]}` : 'none'
@@ -1116,52 +1141,60 @@ async function resolveYouTubeDebug(videoId) {
   }
   stages.bestClient = usedClient;
 
-  // List ALL adaptive video formats for 4K research
-  const allAdaptive = (info.streaming_data?.adaptive_formats || [])
-    .filter(f => f.mime_type?.startsWith('video/'))
-    .sort((a, b) => (b.height || 0) - (a.height || 0))
-    .map(f => ({
-      itag: f.itag,
-      quality: f.quality_label,
-      codec: f.mime_type?.split(';')[0],
-      codecs: f.mime_type?.match(/codecs="([^"]+)"/)?.[1] || '',
-      width: f.width, height: f.height,
-      bitrate: Math.round((f.bitrate || 0) / 1000) + 'kbps',
-      hasUrl: !!f.url,
-    }));
-  stages.allFormats = allAdaptive;
+  // Stage 4: Test HLS manifest (what resolver prefers — 1080p video+audio)
+  stages.formatPriority = 'HLS (1080p) → muxed MP4 (720p) → adaptive is SKIPPED (video-only)';
 
-  // Stage 4: test best adaptive format (what the resolver actually uses)
-  const adaptiveVideo = (info.streaming_data?.adaptive_formats || [])
-    .filter(f => f.mime_type?.startsWith('video/'))
-    .sort((a, b) => {
-      const aH264 = a.mime_type?.includes('avc1') ? 1 : 0;
-      const bH264 = b.mime_type?.includes('avc1') ? 1 : 0;
-      if (aH264 !== bH264) return bH264 - aH264;
-      return (b.height || 0) - (a.height || 0);
-    });
-
-  if (adaptiveVideo.length > 0) {
-    const best = adaptiveVideo[0];
+  if (info.streaming_data?.hls_manifest_url) {
     try {
-      const url = await getFormatUrl(best, yt.session.player);
-      const codec = best.mime_type?.includes('avc1') ? 'H.264' : best.mime_type?.includes('vp9') ? 'VP9' : '';
-      stages.bestFormat = `${best.quality_label} ${codec} ${Math.round((best.bitrate || 0) / 1000)}kbps`;
-      stages.decipherAdaptive = url ? `ok (${url.substring(0, 80)}...)` : 'null url';
+      const hlsRes = await fetch(info.streaming_data.hls_manifest_url);
+      if (hlsRes.ok) {
+        const masterText = await hlsRes.text();
+        const hlsBest = parseHlsBestQuality(masterText);
+        stages.hls = {
+          status: 'ok',
+          bestQuality: hlsBest ? `${hlsBest.height}p @ ${Math.round(hlsBest.bandwidth / 1000)}kbps` : 'unknown',
+          qualities: masterText.match(/RESOLUTION=\d+x\d+/g) || [],
+          url: info.streaming_data.hls_manifest_url.substring(0, 80) + '...',
+        };
+      } else {
+        stages.hls = { status: `fetch failed (${hlsRes.status})` };
+      }
     } catch (e) {
-      stages.decipherAdaptive = `FAILED: ${e.message}`;
+      stages.hls = { status: `error: ${e.message}` };
     }
+  } else {
+    stages.hls = { status: 'not available from this client' };
   }
 
-  // Also test muxed as fallback info
-  if (info.streaming_data?.formats?.length > 0) {
-    const f = info.streaming_data.formats[0];
-    try {
-      const url = await getFormatUrl(f, yt.session.player);
-      stages.decipherMuxed = url ? `ok (${f.quality_label || '360p'})` : 'null url';
-    } catch (e) {
-      stages.decipherMuxed = `FAILED: ${e.message}`;
+  // Stage 5: Test muxed formats (fallback — 720p video+audio)
+  const muxedFormats = info.streaming_data?.formats || [];
+  if (muxedFormats.length > 0) {
+    const muxedResults = [];
+    for (const f of muxedFormats) {
+      try {
+        const url = await getFormatUrl(f, yt.session.player);
+        muxedResults.push({
+          itag: f.itag,
+          quality: f.quality_label || `${f.height}p`,
+          hasUrl: !!url,
+          urlPrefix: url ? url.substring(0, 60) + '...' : null,
+        });
+      } catch (e) {
+        muxedResults.push({ itag: f.itag, error: e.message });
+      }
     }
+    stages.muxed = muxedResults;
+  } else {
+    stages.muxed = 'none available';
+  }
+
+  // Summary: what the resolver would actually return
+  if (info.streaming_data?.hls_manifest_url) {
+    stages.resolverWouldReturn = 'HLS manifest (video+audio, up to 1080p)';
+  } else if (muxedFormats.length > 0) {
+    stages.resolverWouldReturn = `muxed MP4 (${muxedFormats[0]?.quality_label || '720p'}, video+audio)`;
+  } else {
+    stages.resolverWouldReturn = 'null — no playable format (adaptive skipped: video-only)';
   }
 
   return stages;
@@ -1335,7 +1368,7 @@ function deferred() {
 }
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en') {
-  const cacheKey = `trailer:v56:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v58:${lang}:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
