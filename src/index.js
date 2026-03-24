@@ -3,6 +3,7 @@
 
 import { Innertube, Platform } from 'youtubei.js/web';
 import { getQuickJSWASMModule } from '@cf-wasm/quickjs/workerd';
+import { BG } from 'bgutils-js';
 
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
@@ -494,6 +495,138 @@ async function resolveIMDb(imdbId) {
   return null;
 }
 
+// ============== PO_TOKEN GENERATION (BotGuard attestation) ==============
+
+// Minimal DOM mock for BotGuard — it probes these but doesn't need real rendering
+function createBotGuardEnv() {
+  const el = () => ({
+    style: {}, dataset: {}, classList: { add() {}, remove() {}, contains() { return false; } },
+    appendChild(c) { return c; }, removeChild(c) { return c; }, remove() {},
+    setAttribute() {}, getAttribute() { return null; }, getElementsByTagName() { return []; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    innerHTML: '', textContent: '', innerText: '', offsetWidth: 1, offsetHeight: 1,
+    getBoundingClientRect() { return { top: 0, left: 0, bottom: 0, right: 0, width: 1, height: 1 }; },
+  });
+
+  const globalObj = {
+    document: {
+      createElement: () => el(), createElementNS: () => el(), createTextNode: () => el(),
+      getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
+      getElementsByTagName: () => [], getElementsByClassName: () => [],
+      documentElement: { style: {}, getAttribute() { return null; } },
+      head: el(), body: el(), cookie: '',
+      addEventListener() {}, removeEventListener() {},
+    },
+    navigator: {
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      language: 'en-US', languages: ['en-US', 'en'], platform: 'MacIntel',
+      webdriver: false, plugins: { length: 0 }, mimeTypes: { length: 0 },
+      hardwareConcurrency: 8, maxTouchPoints: 0,
+      connection: { effectiveType: '4g' },
+    },
+    performance: { now: () => Date.now(), mark() {}, measure() {}, getEntriesByName() { return []; } },
+    location: { href: 'https://www.youtube.com', origin: 'https://www.youtube.com', protocol: 'https:', hostname: 'www.youtube.com' },
+    screen: { width: 1920, height: 1080, colorDepth: 24 },
+    history: { length: 1 },
+    console, setTimeout, clearTimeout, setInterval, clearInterval,
+    atob, btoa, fetch: (input, init) => fetch(input, init),
+    TextEncoder, TextDecoder, URL, URLSearchParams,
+    Uint8Array, Int32Array, ArrayBuffer, DataView,
+    Object, Array, String, Number, Boolean, RegExp, Date, Math, JSON, Promise, Symbol, Map, Set, WeakMap, WeakSet, Proxy, Reflect,
+    Error, TypeError, RangeError, SyntaxError,
+    parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
+    crypto: { getRandomValues: (arr) => { for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256); return arr; } },
+    requestAnimationFrame: (cb) => setTimeout(cb, 16),
+    cancelAnimationFrame: (id) => clearTimeout(id),
+    getComputedStyle: () => new Proxy({}, { get: () => '' }),
+    matchMedia: () => ({ matches: false, addListener() {}, removeListener() {} }),
+    MutationObserver: class { observe() {} disconnect() {} },
+    ResizeObserver: class { observe() {} disconnect() {} },
+    IntersectionObserver: class { observe() {} disconnect() {} },
+    HTMLElement: class {}, HTMLDivElement: class {}, HTMLScriptElement: class {},
+    Event: class { constructor() {} preventDefault() {} stopPropagation() {} },
+    CustomEvent: class { constructor() {} },
+    XMLHttpRequest: class { open() {} send() {} setRequestHeader() {} addEventListener() {} },
+  };
+
+  globalObj.window = globalObj;
+  globalObj.self = globalObj;
+  globalObj.top = globalObj;
+  globalObj.parent = globalObj;
+  globalObj.globalThis = globalObj;
+  return globalObj;
+}
+
+let _poToken = null;
+let _poTokenExpiry = 0;
+let _visitorData = null;
+
+async function getPoToken() {
+  // Return cached token if still valid (with 5 min buffer)
+  if (_poToken && Date.now() < _poTokenExpiry - 300000) {
+    return { poToken: _poToken, visitorData: _visitorData };
+  }
+
+  try {
+    // Generate visitor_data if we don't have one
+    if (!_visitorData) {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+      let id = '';
+      for (let i = 0; i < 11; i++) id += chars[Math.floor(Math.random() * chars.length)];
+      _visitorData = id;
+    }
+
+    const bgEnv = createBotGuardEnv();
+
+    const bgConfig = {
+      fetch: (input, init) => fetch(input, init),
+      requestKey: 'O43z0dpjhgX20SCx4KAo',
+      globalObj: bgEnv,
+      identifier: _visitorData,
+      useYouTubeAPI: true,
+    };
+
+    // 1. Fetch challenge
+    const challenge = await BG.Challenge.create(bgConfig);
+
+    // 2. Execute the BotGuard interpreter in our mock environment
+    const script = challenge.interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue;
+    const scriptUrl = challenge.interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+
+    if (script) {
+      new Function(script).call(bgEnv);
+    } else if (scriptUrl) {
+      const res = await fetch(scriptUrl);
+      const text = await res.text();
+      new Function(text).call(bgEnv);
+    } else {
+      throw new Error('No interpreter script in challenge');
+    }
+
+    // 3. Generate po_token
+    const { poToken, integrityTokenData } = await BG.PoToken.generate({
+      program: challenge.program,
+      globalName: challenge.globalName,
+      bgConfig,
+    });
+
+    _poToken = poToken;
+    _poTokenExpiry = Date.now() + ((integrityTokenData.estimatedTtlSecs || 3600) * 1000);
+
+    return { poToken: _poToken, visitorData: _visitorData };
+  } catch (e) {
+    // Fallback: cold-start token (works during SPS=2 grace period)
+    if (_visitorData) {
+      const coldToken = BG.PoToken.generateColdStartToken(_visitorData);
+      _poToken = coldToken;
+      _poTokenExpiry = Date.now() + 600000; // 10 min for cold-start
+      return { poToken: coldToken, visitorData: _visitorData };
+    }
+    return { poToken: null, visitorData: null };
+  }
+}
+
 // ============== YOUTUBE RESOLVER ==============
 
 // Uses youtubei.js library with QuickJS WASM as JS interpreter for cipher/nsig deciphering
@@ -546,11 +679,18 @@ async function getInnertube() {
     }
   };
 
-  _innertube = await Innertube.create({
+  // Get po_token for bot attestation (reduces 403s from datacenter IPs)
+  const { poToken, visitorData } = await getPoToken();
+
+  const createOpts = {
     retrieve_player: true,
     generate_session_locally: true,
     enable_safety_mode: false,
-  });
+  };
+  if (poToken) createOpts.po_token = poToken;
+  if (visitorData) createOpts.visitor_data = visitorData;
+
+  _innertube = await Innertube.create(createOpts);
   _innertubeRefresh = now;
   return _innertube;
 }
@@ -667,9 +807,14 @@ async function resolveYouTubeDebug(videoId) {
         return value;
       } finally { vm.dispose(); }
     };
-    yt = await Innertube.create({ retrieve_player: true, generate_session_locally: true, enable_safety_mode: false });
+    const { poToken: debugPot, visitorData: debugVd } = await getPoToken();
+    const debugOpts = { retrieve_player: true, generate_session_locally: true, enable_safety_mode: false };
+    if (debugPot) debugOpts.po_token = debugPot;
+    if (debugVd) debugOpts.visitor_data = debugVd;
+    yt = await Innertube.create(debugOpts);
     stages.innertube = 'ok';
     stages.player = yt.session?.player ? 'loaded' : 'missing';
+    stages.poToken = debugPot ? `valid (expires ${new Date(_poTokenExpiry).toISOString()})` : 'cold-start';
   } catch (e) {
     stages.innertube = `FAILED: ${e.message}`;
     return stages;
