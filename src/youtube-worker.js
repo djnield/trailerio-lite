@@ -159,7 +159,7 @@ async function getInnertube(db = null) {
   const { poToken, visitorData } = await getPoToken(db);
 
   const createOpts = {
-    retrieve_player: true,
+    retrieve_player: false, // IOS returns pre-signed URLs + HLS; player JS blows CPU budget on free plan
     generate_session_locally: true,
     enable_safety_mode: false,
   };
@@ -201,6 +201,10 @@ async function resolveYouTube(youtubeKey, db = null) {
     for (const client of YOUTUBE_CLIENTS) {
       try {
         const info = await yt.getBasicInfo(youtubeKey, { client });
+        if (info.playability_status?.status === 'LOGIN_REQUIRED') {
+          _poToken = null; _poTokenExpiry = 0; _innertube = null;
+          continue;
+        }
         if (info.playability_status?.status !== 'OK' || !info.streaming_data) continue;
         const sd = info.streaming_data;
 
@@ -218,12 +222,16 @@ async function resolveYouTube(youtubeKey, db = null) {
 
         // No muxed — try HLS manifest (AVFoundation native, adaptive bitrate, includes audio)
         if (!bestMuxed && sd.hls_manifest_url) {
+          const adaptiveVideo = (sd.adaptive_formats || [])
+            .filter(f => f.mime_type?.startsWith('video/'))
+            .sort((a, b) => (b.height || 0) - (a.height || 0));
+          const best = adaptiveVideo[0];
           return {
             url: sd.hls_manifest_url,
-            provider: 'YouTube HLS',
-            bitrate: 0,
-            width: 1920,
-            height: 1080,
+            provider: `YouTube ${best?.quality_label || 'HLS'}`,
+            bitrate: best?.bitrate ? Math.round(best.bitrate / 1000) : 0,
+            width: best?.width || 0,
+            height: best?.height || 0,
           };
         }
       } catch { /* try next client */ }

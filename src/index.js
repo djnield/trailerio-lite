@@ -145,7 +145,7 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en', db = null) {
         const score = v => (v.type === 'Trailer' ? 0 : v.type === 'Teaser' ? 1 : 2);
         return score(a) - score(b);
       });
-    const youtubeKeys = ytVideos.slice(0, 1).map(v => v.key);
+    const youtubeKeys = ytVideos.slice(0, 3).map(v => v.key);
 
     const tmdbMeta = {
       tmdbId,
@@ -611,6 +611,7 @@ async function getTvdbToken() {
 
 async function getTvdbYouTubeKey(imdbId, lang = 'en') {
   if (!imdbId) return null;
+  for (let attempt = 0; attempt < 2; attempt++) {
   try {
     const token = await getTvdbToken();
     if (!token) return null;
@@ -621,6 +622,7 @@ async function getTvdbYouTubeKey(imdbId, lang = 'en') {
       `https://api4.thetvdb.com/v4/search/remoteid/${imdbId}`,
       { headers }, 5000
     );
+    if (searchRes.status === 401) { _tvdbToken = null; _tvdbTokenExpiry = 0; continue; }
     const searchData = await searchRes.json();
     const entry = searchData?.data?.[0];
 
@@ -654,6 +656,7 @@ async function getTvdbYouTubeKey(imdbId, lang = 'en') {
     const match = pick.url.match(/(?:[?&]v=|\/(?:embed|v|shorts)\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
     return match ? match[1] : null;
   } catch { /* TVDB unavailable */ }
+  }
   return null;
 }
 
@@ -662,13 +665,24 @@ async function getTvdbYouTubeKey(imdbId, lang = 'en') {
 async function resolveYouTube(youtubeKey, env) {
   if (!youtubeKey || !env.YOUTUBE) return null;
   try {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 8000);
     const resp = await env.YOUTUBE.fetch(new Request('https://youtube/resolve', {
       method: 'POST',
       body: JSON.stringify({ key: youtubeKey }),
+      signal: controller.signal,
     }));
+    clearTimeout(tid);
     if (!resp.ok) return null;
     return await resp.json();
   } catch { return null; }
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
+  ]);
 }
 
 // ============== DAILYMOTION RESOLVER (shared utility) ==============
@@ -905,25 +919,34 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
   })();
 
   // ---------- ALL SOURCES IN PARALLEL (no phases, no waterfall) ----------
+  let youtubeResult = null;
   const sources = [
     // IMDb - needs nothing, starts immediately
     resolveIMDb(imdbId),
 
-    // YouTube - tries TMDB keys first, falls back to AniList + TVDB in parallel
+    // YouTube - tries all TMDB keys, then AniList + TVDB fallback
     (async () => {
       try {
-        const tmdbMeta = await tmdbReady.promise;
-        const keys = tmdbMeta?.youtubeKeys;
-        if (keys?.length) return resolveYouTube(keys[0], env);
+        const tmdbMeta = await withTimeout(tmdbReady.promise, 6000);
+        const keys = tmdbMeta?.youtubeKeys || [];
 
-        // No TMDB keys — try AniList + TVDB in parallel (first one wins)
-        const { wikidataIds } = await metaReady.promise;
+        // Try all TMDB keys (not just first — handles deleted/restricted videos)
+        for (const key of keys) {
+          const result = await resolveYouTube(key, env);
+          if (result) { youtubeResult = result; return result; }
+        }
+
+        // TMDB keys failed/empty — AniList + TVDB parallel fallback
+        const { wikidataIds } = await withTimeout(metaReady.promise, 8000);
         const [aniListKey, tvdbKey] = await Promise.all([
           getAniListYouTubeKey(wikidataIds?.malId).catch(() => null),
           getTvdbYouTubeKey(imdbId, lang).catch(() => null),
         ]);
         const ytKey = aniListKey || tvdbKey;
-        if (ytKey) return resolveYouTube(ytKey, env);
+        if (ytKey) {
+          const result = await resolveYouTube(ytKey, env);
+          if (result) { youtubeResult = result; return result; }
+        }
 
         return null;
       } catch { return null; }
@@ -984,11 +1007,9 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
     .filter(r => r.status === 'fulfilled')
     .map(r => r.value);
 
-  // Check if YouTube was expected but failed (cold-start / BotGuard timeout)
-  // sources[1] is the YouTube source (index 1 in settled = index 2)
-  const ytResult = settled[2]?.status === 'fulfilled' ? settled[2].value : null;
+  // Check if YouTube was expected but failed
   const hadYouTubeKeys = metaResult?.tmdbMeta?.youtubeKeys?.length > 0;
-  const youtubeFailed = hadYouTubeKeys && !ytResult;
+  const youtubeFailed = hadYouTubeKeys && !youtubeResult;
 
   // Quality tier from largest dimension (aspect-ratio agnostic)
   const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
