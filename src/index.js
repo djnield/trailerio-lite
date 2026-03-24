@@ -4,6 +4,7 @@
 import { Innertube, Platform } from 'youtubei.js/web';
 import { getQuickJSWASMModule } from '@cf-wasm/quickjs/workerd';
 import { BG } from 'bgutils-js';
+import vm from 'node:vm';
 
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
@@ -593,15 +594,16 @@ async function getPoToken() {
     const challenge = await BG.Challenge.create(bgConfig);
 
     // 2. Execute the BotGuard interpreter in our mock environment
+    // Uses node:vm instead of new Function() (blocked by Workers without unsafe-eval)
     const script = challenge.interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue;
     const scriptUrl = challenge.interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
 
     if (script) {
-      new Function(script).call(bgEnv);
+      vm.runInNewContext(script, bgEnv, { timeout: 5000 });
     } else if (scriptUrl) {
       const res = await fetch(scriptUrl);
       const text = await res.text();
-      new Function(text).call(bgEnv);
+      vm.runInNewContext(text, bgEnv, { timeout: 5000 });
     } else {
       throw new Error('No interpreter script in challenge');
     }
