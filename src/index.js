@@ -945,6 +945,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
       try {
         const tmdbMeta = await withTimeout(tmdbReady.promise, 6000);
         const keys = tmdbMeta?.youtubeKeys || [];
+        if (keys.length === 0) { ytErrors.push('no_tmdb_keys'); }
 
         // Try all TMDB keys (not just first — handles deleted/restricted videos)
         for (const key of keys) {
@@ -966,7 +967,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
         }
 
         return null;
-      } catch { return null; }
+      } catch (e) { ytErrors.push(`catch:${e?.message || 'unknown'}`); return null; }
     })(),
 
     // Plex - only needs actualType from TMDB, starts as soon as TMDB find completes
