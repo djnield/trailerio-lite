@@ -7,3 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 binding = "DB"
 database_name = "trailerio-cache"
 database_id = "4e88de1b-0473-4078-9edb-437989ab33e9"
+
+[[services]]
+binding = "YOUTUBE"
+service = "trailerio-youtube"
