@@ -498,7 +498,7 @@ async function resolveMUBI(imdbId, meta, lang = 'en') {
           trailerUrls.sort((a, b) => parseInt(b[1]) - parseInt(a[1]));
           const bestUrl = trailerUrls[0][0];
           const height = parseInt(trailerUrls[0][1]) || 720;
-          return { url: bestUrl, provider: `MUBI ${height}p`, bitrate: 0, width: Math.round(height * 16 / 9), height, localized: lang !== 'en' };
+          return { url: bestUrl, provider: `MUBI ${height}p`, bitrate: 0, width: Math.round(height * 16 / 9), height };
         }
       }
     }

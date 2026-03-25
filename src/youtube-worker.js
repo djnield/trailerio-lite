@@ -52,7 +52,7 @@ function generateColdStartToken(identifier) {
 const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 const ORIGIN = 'https://www.youtube.com';
 
-// Multiple client configs — different rate limit pools
+// Apple ecosystem clients — all return HLS, different rate limit pools
 const CLIENTS = [
   {
     name: 'IOS', id: '5',
@@ -61,26 +61,18 @@ const CLIENTS = [
     extra: { deviceMake: 'Apple', deviceModel: 'iPhone10,4', osName: 'iOS', osVersion: '16.7.7.20H330', platform: 'MOBILE' },
   },
   {
-    name: 'ANDROID', id: '3',
-    clientName: 'ANDROID', clientVersion: '21.03.36',
-    ua: 'com.google.android.youtube/21.03.36(Linux; U; Android 16; en_US; SM-S908E Build/TP1A.220624.014) gzip',
-    extra: { deviceMake: 'Samsung', deviceModel: 'SM-S908E', osName: 'Android', osVersion: '16', platform: 'MOBILE', androidSdkVersion: 36 },
+    name: 'TVOS', id: '5',
+    clientName: 'iOS', clientVersion: '20.11.6',
+    ua: 'com.google.ios.youtube/20.11.6 (AppleTV11,1; U; CPU OS 18_3 like Mac OS X)',
+    extra: { deviceMake: 'Apple', deviceModel: 'AppleTV11,1', osName: 'tvOS', osVersion: '18.3', platform: 'MOBILE' },
   },
   {
-    name: 'TV', id: '7',
-    clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0',
-    ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Version/5.0 TV Safari/537.36',
-    extra: { platform: 'TV' },
+    name: 'IPADOS', id: '5',
+    clientName: 'iOS', clientVersion: '20.11.6',
+    ua: 'com.google.ios.youtube/20.11.6 (iPad13,18; U; CPU OS 17_7_6 like Mac OS X)',
+    extra: { deviceMake: 'Apple', deviceModel: 'iPad13,18', osName: 'iPadOS', osVersion: '17.7.6', platform: 'MOBILE' },
   },
 ];
-
-// WEB client — used with auth cookies for highest reliability
-const WEB_CLIENT = {
-  name: 'WEB_AUTH', id: '1',
-  clientName: 'WEB', clientVersion: '2.20250320.01.00',
-  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-  extra: { platform: 'DESKTOP', browserName: 'Chrome', browserVersion: '134.0.0.0', osName: 'Windows', osVersion: '10.0' },
-};
 
 // ============== SAPISIDHASH AUTH ==============
 
@@ -127,57 +119,30 @@ function buildPlayerBody(videoId, visitorData, poToken, client) {
   return body;
 }
 
-async function fetchPlayer(videoId, visitorData, poToken, client) {
+async function fetchPlayer(videoId, visitorData, poToken, client, cookieMap) {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 8000);
   try {
+    const hdrs = {
+      'Content-Type': 'application/json',
+      'User-Agent': client.ua,
+      'X-Goog-Visitor-Id': visitorData,
+      'X-Youtube-Client-Name': client.id,
+      'X-Youtube-Client-Version': client.clientVersion,
+    };
+    // Inject auth headers if cookies provided
+    if (cookieMap?.SAPISID) {
+      hdrs['Authorization'] = await generateSapisidHash(cookieMap.SAPISID);
+      hdrs['Cookie'] = buildCookieHeader(cookieMap);
+      hdrs['Origin'] = ORIGIN;
+      hdrs['Referer'] = `${ORIGIN}/`;
+      hdrs['X-Origin'] = ORIGIN;
+    }
     const resp = await fetch(
       `https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json&key=${INNERTUBE_KEY}`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': client.ua,
-          'X-Goog-Visitor-Id': visitorData,
-          'X-Youtube-Client-Name': client.id,
-          'X-Youtube-Client-Version': client.clientVersion,
-        },
+        headers: hdrs,
         body: JSON.stringify(buildPlayerBody(videoId, visitorData, poToken, client)),
-        signal: controller.signal,
-      }
-    );
-    clearTimeout(tid);
-    return await resp.json();
-  } catch {
-    clearTimeout(tid);
-    return null;
-  }
-}
-
-async function fetchPlayerAuth(videoId, cookieMap) {
-  const sapisid = cookieMap.SAPISID;
-  if (!sapisid) return null;
-
-  const controller = new AbortController();
-  const tid = setTimeout(() => controller.abort(), 8000);
-  try {
-    const authHeader = await generateSapisidHash(sapisid);
-    const visitorData = generateVisitorData();
-    const resp = await fetch(
-      `https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json&key=${INNERTUBE_KEY}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': WEB_CLIENT.ua,
-          'X-Goog-Visitor-Id': visitorData,
-          'X-Youtube-Client-Name': WEB_CLIENT.id,
-          'X-Youtube-Client-Version': WEB_CLIENT.clientVersion,
-          'Authorization': authHeader,
-          'Cookie': buildCookieHeader(cookieMap),
-          'Origin': ORIGIN,
-          'Referer': `${ORIGIN}/`,
-          'X-Origin': ORIGIN,
-        },
-        body: JSON.stringify(buildPlayerBody(videoId, visitorData, null, WEB_CLIENT)),
         signal: controller.signal,
       }
     );
@@ -232,10 +197,12 @@ async function resolveYouTube(youtubeKey, db, cookieMap) {
   const cached = await d1Get(db, `yt:v2:${youtubeKey}`);
   if (cached) return cached;
 
-  // Priority 1: Authenticated WEB client (if cookies configured)
+  // Priority 1: iOS with auth (HLS 1080p+ with auth reliability)
   if (cookieMap?.SAPISID) {
     try {
-      const data = await fetchPlayerAuth(youtubeKey, cookieMap);
+      const visitorData = generateVisitorData();
+      const poToken = generateColdStartToken(visitorData);
+      const data = await fetchPlayer(youtubeKey, visitorData, poToken, CLIENTS[0], cookieMap);
       if (data?.playabilityStatus?.status === 'OK' && data.streamingData) {
         const result = extractResult(data.streamingData);
         if (result) {
@@ -274,19 +241,21 @@ async function resolveYouTube(youtubeKey, db, cookieMap) {
 async function resolveYouTubeDebug(videoId, db, cookieMap) {
   const stages = { videoId, timestamp: new Date().toISOString(), auth: !!cookieMap?.SAPISID, clients: {} };
 
-  // Test auth client if available
+  // Test iOS with auth if available
   if (cookieMap?.SAPISID) {
     try {
-      const data = await fetchPlayerAuth(videoId, cookieMap);
+      const visitorData = generateVisitorData();
+      const poToken = generateColdStartToken(visitorData);
+      const data = await fetchPlayer(videoId, visitorData, poToken, CLIENTS[0], cookieMap);
       const sd = data?.streamingData;
-      stages.clients['WEB_AUTH'] = {
+      stages.clients['IOS_AUTH'] = {
         playability: data?.playabilityStatus?.status || 'unknown',
         reason: data?.playabilityStatus?.reason || null,
         muxedFormats: sd?.formats?.length || 0,
         adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
         hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
       };
-    } catch (e) { stages.clients['WEB_AUTH'] = { error: e.message }; }
+    } catch (e) { stages.clients['IOS_AUTH'] = { error: e.message }; }
   }
 
   for (const client of CLIENTS) {
