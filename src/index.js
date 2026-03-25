@@ -705,6 +705,11 @@ async function resolveDailymotion(dmVideoId, providerLabel) {
     const qualities = data.qualities;
     if (!qualities) return null;
 
+    // Reject generic promo reels based on actual Dailymotion video title
+    const dmTitle = data.title || '';
+    const junkDm = /\ben \d{4} sur\b|sorties? (netflix|disney|prime|canal|paramount)/i;
+    if (junkDm.test(dmTitle)) return null;
+
     // Try resolution-specific MP4 first
     for (const res of ['1080', '720', '480', '380', '240']) {
       const streams = qualities[res];
