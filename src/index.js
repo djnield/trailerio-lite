@@ -767,7 +767,7 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
 
     // Filter to trailer-related entries only
     const trailers = cleaned.filter(e => /trailer|bande|teaser|tráiler|fragman/i.test(e.title));
-    const pool = trailers.length > 0 ? trailers : cleaned.length > 0 ? cleaned : all;
+    const pool = trailers.length > 0 ? trailers : cleaned;
 
     if (pool.length > 0) {
       const { best, dubbed } = pickBestVersion(pool, dubbedRe, originalRe);
