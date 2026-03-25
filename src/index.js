@@ -41,6 +41,13 @@ function getManifest(lang) {
 
 const CACHE_TTL = 14400; // 4 hours max ceiling
 
+function isPermanentUrl(url) {
+  if (/\/expire\/\d+\//.test(url)) return false;    // YouTube
+  if (/[?&]Expires=\d+/.test(url)) return false;     // IMDb
+  if (/[?&]sec=/.test(url)) return false;             // Dailymotion HLS tokens
+  return true;
+}
+
 function getMinExpiry(links) {
   const now = Math.floor(Date.now() / 1000);
   let minExpiry = 0;
@@ -912,17 +919,31 @@ function deferred() {
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, env = {}, ctx = null) {
   const db = env.DB || null;
   const cacheKey = `trailer:v68:${lang}:${imdbId}`;
+  const baseKey = `base:${lang}:${imdbId}`;
+
   if (!fresh) {
     // Check edge cache first (fastest, per-PoP)
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
-    if (cached) {
-      return await cached.json();
-    }
-    // Fall back to D1 (global, persistent)
+    if (cached) return await cached.json();
+
+    // Fall back to D1 full cache (global, persistent)
     const d1Cached = await d1Get(db, cacheKey);
     if (d1Cached) return d1Cached;
+
+    // Full cache expired — serve permanent sources instantly, refresh in background
+    const baseCached = await d1Get(db, baseKey);
+    if (baseCached) {
+      if (ctx) {
+        ctx.waitUntil(resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey, baseKey, db));
+      }
+      return baseCached;
+    }
   }
 
+  return resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey, baseKey, db);
+}
+
+async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey, baseKey, db) {
   // Shared deferred signals - sources await these instead of blocking in phases
   const metaReady = deferred();     // resolves with { tmdbMeta, wikidataIds }
   const tmdbReady = deferred();     // resolves with tmdbMeta (for Plex actualType)
@@ -1080,6 +1101,12 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
     });
     await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
     d1Set(db, cacheKey, result, ttl);
+
+    // Cache permanent sources separately (30 days) for instant fallback
+    const permanentLinks = links.filter(l => isPermanentUrl(l.trailers));
+    if (permanentLinks.length > 0) {
+      d1Set(db, baseKey, { title: result.title, links: permanentLinks }, 2592000);
+    }
   }
 
   // Background retry: if YouTube failed, retry without time pressure and update cache
