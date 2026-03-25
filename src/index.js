@@ -169,7 +169,7 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en', db = null) {
         const typeScore = v => (v.type === 'Trailer' ? 0 : v.type === 'Teaser' ? 1 : 2);
         return (langScore(a) - langScore(b)) || (typeScore(a) - typeScore(b));
       });
-    const youtubeKeys = ytVideos.slice(0, 3).map(v => v.key);
+    const youtubeKeys = ytVideos.slice(0, 3).map(v => ({ key: v.key, lang: v.iso_639_1 }));
 
     const tmdbMeta = {
       tmdbId,
@@ -985,10 +985,13 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
         if (keys.length === 0) { ytErrors.push('no_tmdb_keys'); }
 
         // Try all TMDB keys (not just first — handles deleted/restricted videos)
-        for (const key of keys) {
-          const result = await resolveYouTube(key, env, lang);
-          if (result?._ytError) { ytErrors.push(`${key}:${result._ytError}`); continue; }
-          if (result) { youtubeResult = result; return result; }
+        for (const keyInfo of keys) {
+          const result = await resolveYouTube(keyInfo.key, env, lang);
+          if (result?._ytError) { ytErrors.push(`${keyInfo.key}:${result._ytError}`); continue; }
+          if (result) {
+            if (lang !== 'en' && keyInfo.lang === lang) result.localized = true;
+            youtubeResult = result; return result;
+          }
         }
 
         // TMDB keys failed/empty — AniList + TVDB parallel fallback
@@ -1116,8 +1119,8 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
     ctx.waitUntil((async () => {
       try {
         const keys = metaResult?.tmdbMeta?.youtubeKeys || [];
-        for (const key of keys) {
-          const ytResult = await resolveYouTube(key, env, lang);
+        for (const keyInfo of keys) {
+          const ytResult = await resolveYouTube(keyInfo.key, env, lang);
           if (ytResult && !ytResult._ytError) {
             // Re-sort: YouTube on top, demote previous star
             const updatedLinks = [
@@ -1227,6 +1230,25 @@ export default {
     // Health check
     if (pathname === '/health') {
       return new Response(JSON.stringify({ status: 'ok', edge: request.cf?.colo, lang }), { headers: corsHeaders });
+    }
+
+    // Cache stats endpoint (D1)
+    if (pathname === '/cache/stats') {
+      const db = env.DB;
+      if (!db) return new Response(JSON.stringify({ error: 'No D1' }), { status: 503, headers: corsHeaders });
+      const now = Math.floor(Date.now() / 1000);
+      const [total, active, trailers, base] = await Promise.all([
+        db.prepare('SELECT COUNT(*) as c FROM cache').first(),
+        db.prepare('SELECT COUNT(*) as c FROM cache WHERE expires_at > ?').bind(now).first(),
+        db.prepare("SELECT COUNT(*) as c FROM cache WHERE key LIKE 'trailer:%' AND expires_at > ?").bind(now).first(),
+        db.prepare("SELECT COUNT(*) as c FROM cache WHERE key LIKE 'base:%' AND expires_at > ?").bind(now).first(),
+      ]);
+      return new Response(JSON.stringify({
+        total: total?.c || 0,
+        active: active?.c || 0,
+        activeTrailers: trailers?.c || 0,
+        activeBaseCache: base?.c || 0,
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
     // YouTube debug endpoint
