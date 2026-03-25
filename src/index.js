@@ -563,9 +563,11 @@ async function resolveIMDb(imdbId) {
     if (!best) best = mp4s[0] || urls[0];
     if (!best?.url) return null;
 
-    const quality = best.displayName?.value || '';
-    const height = quality.match(/(\d+)p/)?.[1] || 0;
-    return { url: best.url, provider: `IMDb ${quality}`.trim(), bitrate: 0, width: 0, height: parseInt(height) || 0 };
+    const rawQuality = best.displayName?.value || '';
+    const heightMatch = rawQuality.match(/(\d+)p/);
+    const height = heightMatch ? parseInt(heightMatch[1]) : 0;
+    const quality = heightMatch ? `${height}p` : 'SD';
+    return { url: best.url, provider: `IMDb ${quality}`, bitrate: 0, width: 0, height };
   } catch (e) { /* silent fail */ }
   return null;
 }
@@ -859,7 +861,7 @@ async function resolveMYMovies(meta) {
     // Path A: Direct MP4 source from <source src="..."> tag
     const srcMatch = html.match(/src="(https?:\/\/[^"]+\.mp4[^"]*)"/);
     if (srcMatch) {
-      return { url: srcMatch[1], provider: 'MYmovies', bitrate: 0, width: 0, height: 1080, localized: true };
+      return { url: srcMatch[1], provider: 'MYmovies 1080p', bitrate: 0, width: 0, height: 1080, localized: true };
     }
     // Path B: Dailymotion video ID embedded in player
     const dmMatch = html.match(/(?:dailymotion\.com\/(?:embed\/)?video\/|video_id["':\s]+["']?)([a-zA-Z0-9]+)/);
