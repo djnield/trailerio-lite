@@ -761,9 +761,13 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
       .map(m => ({ id: m[2], title: m[1] }));
     const all = [...entries, ...entriesRev];
 
+    // Remove generic promo reels (e.g. "En 2026 sur Netflix", "Sorties Disney+")
+    const junkVideo = /\ben \d{4} sur\b|sorties? (netflix|disney|prime|canal|paramount)/i;
+    const cleaned = all.filter(e => !junkVideo.test(e.title));
+
     // Filter to trailer-related entries only
-    const trailers = all.filter(e => /trailer|bande|teaser|tráiler|fragman/i.test(e.title));
-    const pool = trailers.length > 0 ? trailers : all;
+    const trailers = cleaned.filter(e => /trailer|bande|teaser|tráiler|fragman/i.test(e.title));
+    const pool = trailers.length > 0 ? trailers : cleaned.length > 0 ? cleaned : all;
 
     if (pool.length > 0) {
       const { best, dubbed } = pickBestVersion(pool, dubbedRe, originalRe);
