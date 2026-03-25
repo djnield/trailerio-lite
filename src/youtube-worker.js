@@ -50,7 +50,6 @@ function generateColdStartToken(identifier) {
 // ============== INNERTUBE PLAYER API (replaces youtubei.js) ==============
 
 const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-const ORIGIN = 'https://www.youtube.com';
 
 // Apple ecosystem clients — all return HLS, different rate limit pools
 const CLIENTS = [
@@ -74,36 +73,29 @@ const CLIENTS = [
   },
 ];
 
-// WEB fallback — used with auth cookies when all Apple clients fail (LOGIN_REQUIRED)
-const WEB_CLIENT = {
-  name: 'WEB_AUTH', id: '1',
-  clientName: 'WEB', clientVersion: '2.20250320.01.00',
-  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-  extra: { platform: 'DESKTOP', browserName: 'Chrome', browserVersion: '134.0.0.0', osName: 'Windows', osVersion: '10.0' },
-};
+// ============== OAUTH TOKEN MANAGEMENT ==============
 
-// ============== SAPISIDHASH AUTH ==============
+const OAUTH_CLIENT_ID = '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com';
+const OAUTH_CLIENT_SECRET = 'SboVhoG9s0rNafixCSGGKXAT';
 
-async function generateSapisidHash(sapisid) {
-  const ts = Math.floor(Date.now() / 1000);
-  const input = `${ts} ${sapisid} ${ORIGIN}`;
-  const hash = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(input));
-  const hex = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
-  return `SAPISIDHASH ${ts}_${hex}`;
-}
+// In-memory token cache (lives until worker eviction, ~5-30 min)
+let cachedAccessToken = null;
+let tokenExpiresAt = 0;
 
-function parseCookies(cookieJson) {
-  try {
-    const cookies = JSON.parse(cookieJson);
-    const map = {};
-    for (const c of cookies) map[c.name] = c.value;
-    return map;
-  } catch { return null; }
-}
+async function getAccessToken(refreshToken) {
+  if (cachedAccessToken && Date.now() < tokenExpiresAt) return cachedAccessToken;
 
-function buildCookieHeader(cookieMap) {
-  const needed = ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID', '__Secure-1PSID', '__Secure-3PSID', 'LOGIN_INFO'];
-  return needed.filter(n => cookieMap[n]).map(n => `${n}=${cookieMap[n]}`).join('; ');
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `client_id=${OAUTH_CLIENT_ID}&client_secret=${OAUTH_CLIENT_SECRET}&refresh_token=${refreshToken}&grant_type=refresh_token`,
+  });
+  const data = await resp.json();
+  if (!data.access_token) return null;
+
+  cachedAccessToken = data.access_token;
+  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh 60s early
+  return cachedAccessToken;
 }
 
 // ============== PLAYER FETCH ==============
@@ -127,7 +119,7 @@ function buildPlayerBody(videoId, visitorData, poToken, client) {
   return body;
 }
 
-async function fetchPlayer(videoId, visitorData, poToken, client, cookieMap) {
+async function fetchPlayer(videoId, visitorData, poToken, client, accessToken) {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 8000);
   try {
@@ -138,13 +130,9 @@ async function fetchPlayer(videoId, visitorData, poToken, client, cookieMap) {
       'X-Youtube-Client-Name': client.id,
       'X-Youtube-Client-Version': client.clientVersion,
     };
-    // Inject auth headers if cookies provided
-    if (cookieMap?.SAPISID) {
-      hdrs['Authorization'] = await generateSapisidHash(cookieMap.SAPISID);
-      hdrs['Cookie'] = buildCookieHeader(cookieMap);
-      hdrs['Origin'] = ORIGIN;
-      hdrs['Referer'] = `${ORIGIN}/`;
-      hdrs['X-Origin'] = ORIGIN;
+    // OAuth Bearer token for authenticated requests
+    if (accessToken) {
+      hdrs['Authorization'] = `Bearer ${accessToken}`;
     }
     const resp = await fetch(
       `https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json&key=${INNERTUBE_KEY}`, {
@@ -198,14 +186,38 @@ function extractResult(sd) {
   return null;
 }
 
-async function resolveYouTube(youtubeKey, db, cookieMap) {
+async function resolveYouTube(youtubeKey, db, refreshToken) {
   if (!youtubeKey) return null;
 
   // Check D1 cache (cached trailer URLs, not tokens)
   const cached = await d1Get(db, `yt:v2:${youtubeKey}`);
   if (cached) return cached;
 
-  // Priority 1: Apple clients (iOS/tvOS/iPadOS) — all return HLS 1080p+
+  // Get OAuth access token if refresh token is configured
+  const accessToken = refreshToken ? await getAccessToken(refreshToken) : null;
+
+  // Priority 1: Authenticated Apple clients (OAuth + HLS 1080p+)
+  if (accessToken) {
+    for (const client of CLIENTS) {
+      try {
+        const visitorData = generateVisitorData();
+        const poToken = generateColdStartToken(visitorData);
+        const data = await fetchPlayer(youtubeKey, visitorData, poToken, client, accessToken);
+        if (!data) continue;
+
+        const status = data.playabilityStatus?.status;
+        if (status !== 'OK' || !data.streamingData) continue;
+
+        const result = extractResult(data.streamingData);
+        if (result) {
+          await d1Set(db, `yt:v2:${youtubeKey}`, result, 21600);
+          return result;
+        }
+      } catch { /* try next client */ }
+    }
+  }
+
+  // Priority 2: Anonymous Apple clients (fallback)
   for (const client of CLIENTS) {
     try {
       const visitorData = generateVisitorData();
@@ -225,29 +237,35 @@ async function resolveYouTube(youtubeKey, db, cookieMap) {
     } catch { /* try next client */ }
   }
 
-  // Priority 2: WEB + auth fallback (for LOGIN_REQUIRED cases)
-  if (cookieMap?.SAPISID) {
-    try {
-      const visitorData = generateVisitorData();
-      const data = await fetchPlayer(youtubeKey, visitorData, null, WEB_CLIENT, cookieMap);
-      if (data?.playabilityStatus?.status === 'OK' && data.streamingData) {
-        const result = extractResult(data.streamingData);
-        if (result) {
-          await d1Set(db, `yt:v2:${youtubeKey}`, result, 21600);
-          return result;
-        }
-      }
-    } catch { /* silent */ }
-  }
-
   return null;
 }
 
 // ============== DEBUG ENDPOINT ==============
 
-async function resolveYouTubeDebug(videoId, db, cookieMap) {
-  const stages = { videoId, timestamp: new Date().toISOString(), auth: !!cookieMap?.SAPISID, clients: {} };
+async function resolveYouTubeDebug(videoId, db, refreshToken) {
+  const accessToken = refreshToken ? await getAccessToken(refreshToken) : null;
+  const stages = { videoId, timestamp: new Date().toISOString(), oauth: !!accessToken, clients: {} };
 
+  // Test authenticated Apple clients
+  if (accessToken) {
+    for (const client of CLIENTS) {
+      const visitorData = generateVisitorData();
+      const poToken = generateColdStartToken(visitorData);
+      const data = await fetchPlayer(videoId, visitorData, poToken, client, accessToken);
+      if (!data) { stages.clients[`${client.name}_AUTH`] = { error: 'fetch failed' }; continue; }
+
+      const sd = data.streamingData;
+      stages.clients[`${client.name}_AUTH`] = {
+        playability: data.playabilityStatus?.status || 'unknown',
+        reason: data.playabilityStatus?.reason || null,
+        muxedFormats: sd?.formats?.length || 0,
+        adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
+        hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
+      };
+    }
+  }
+
+  // Test anonymous Apple clients
   for (const client of CLIENTS) {
     const visitorData = generateVisitorData();
     const poToken = generateColdStartToken(visitorData);
@@ -264,23 +282,7 @@ async function resolveYouTubeDebug(videoId, db, cookieMap) {
     };
   }
 
-  // Test WEB + auth fallback
-  if (cookieMap?.SAPISID) {
-    try {
-      const visitorData = generateVisitorData();
-      const data = await fetchPlayer(videoId, visitorData, null, WEB_CLIENT, cookieMap);
-      const sd = data?.streamingData;
-      stages.clients['WEB_AUTH'] = {
-        playability: data?.playabilityStatus?.status || 'unknown',
-        reason: data?.playabilityStatus?.reason || null,
-        muxedFormats: sd?.formats?.length || 0,
-        adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
-        hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
-      };
-    } catch (e) { stages.clients['WEB_AUTH'] = { error: e.message }; }
-  }
-
-  const result = await resolveYouTube(videoId, db, cookieMap);
+  const result = await resolveYouTube(videoId, db, refreshToken);
   stages.resolverResult = result ? result.provider : 'null';
   return stages;
 }
@@ -302,18 +304,17 @@ export default {
     const pathname = url.pathname;
 
     try {
-      // Parse auth cookies from secret (if configured)
-      const cookieMap = env.YOUTUBE_COOKIES ? parseCookies(env.YOUTUBE_COOKIES) : null;
+      const refreshToken = env.YOUTUBE_REFRESH_TOKEN || null;
 
       if (pathname === '/resolve' && request.method === 'POST') {
         const { key } = await request.json();
-        const result = await resolveYouTube(key, env.DB, cookieMap);
+        const result = await resolveYouTube(key, env.DB, refreshToken);
         return new Response(JSON.stringify(result), { headers });
       }
 
       const debugMatch = pathname.match(/^\/debug\/(.+)$/);
       if (debugMatch) {
-        const result = await resolveYouTubeDebug(debugMatch[1], env.DB, cookieMap);
+        const result = await resolveYouTubeDebug(debugMatch[1], env.DB, refreshToken);
         return new Response(JSON.stringify(result, null, 2), { headers });
       }
 
