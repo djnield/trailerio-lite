@@ -134,7 +134,7 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en', db = null) {
     const [extData, videosData] = await Promise.all([
       fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`)
         .then(r => r.json()).catch(() => ({})),
-      fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/videos?api_key=${TMDB_API_KEY}&language=${lang}&include_video_language=${lang},en,ja,null`)
+      fetchWithTimeout(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/videos?api_key=${TMDB_API_KEY}&language=${lang}&include_video_language=${lang},en,null`)
         .then(r => r.json()).catch(() => ({ results: [] }))
     ]);
 
