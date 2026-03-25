@@ -138,12 +138,13 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en', db = null) {
         .then(r => r.json()).catch(() => ({ results: [] }))
     ]);
 
-    // Pick YouTube trailer keys, preferring official trailers
+    // Pick YouTube trailer keys, preferring user's language then official trailers
     const ytVideos = (videosData.results || [])
       .filter(v => v.site === 'YouTube' && v.key)
       .sort((a, b) => {
-        const score = v => (v.type === 'Trailer' ? 0 : v.type === 'Teaser' ? 1 : 2);
-        return score(a) - score(b);
+        const langScore = v => (v.iso_639_1 === lang ? 0 : v.iso_639_1 === 'en' ? 1 : 2);
+        const typeScore = v => (v.type === 'Trailer' ? 0 : v.type === 'Teaser' ? 1 : 2);
+        return (langScore(a) - langScore(b)) || (typeScore(a) - typeScore(b));
       });
     const youtubeKeys = ytVideos.slice(0, 3).map(v => v.key);
 
@@ -662,14 +663,14 @@ async function getTvdbYouTubeKey(imdbId, lang = 'en') {
 
 // ============== YOUTUBE (via service binding) ==============
 
-async function resolveYouTube(youtubeKey, env) {
+async function resolveYouTube(youtubeKey, env, lang = 'en') {
   if (!youtubeKey || !env.YOUTUBE) return null;
   try {
     const controller = new AbortController();
     const tid = setTimeout(() => controller.abort(), 8000);
     const resp = await env.YOUTUBE.fetch(new Request('https://youtube/resolve', {
       method: 'POST',
-      body: JSON.stringify({ key: youtubeKey }),
+      body: JSON.stringify({ key: youtubeKey, lang }),
       signal: controller.signal,
     }));
     clearTimeout(tid);
@@ -932,7 +933,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
 
         // Try all TMDB keys (not just first — handles deleted/restricted videos)
         for (const key of keys) {
-          const result = await resolveYouTube(key, env);
+          const result = await resolveYouTube(key, env, lang);
           if (result) { youtubeResult = result; return result; }
         }
 
@@ -944,7 +945,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
         ]);
         const ytKey = aniListKey || tvdbKey;
         if (ytKey) {
-          const result = await resolveYouTube(ytKey, env);
+          const result = await resolveYouTube(ytKey, env, lang);
           if (result) { youtubeResult = result; return result; }
         }
 

@@ -75,11 +75,16 @@ const CLIENTS = [
 
 // ============== PLAYER FETCH ==============
 
-function buildPlayerBody(videoId, visitorData, poToken, client) {
+const LANG_TO_GL = {
+  en: 'US', fr: 'FR', de: 'DE', it: 'IT', es: 'ES', pt: 'BR',
+  ru: 'RU', ja: 'JP', ko: 'KR', cs: 'CZ', hi: 'IN', tr: 'TR', ar: 'AE',
+};
+
+function buildPlayerBody(videoId, visitorData, poToken, client, lang = 'en') {
   const body = {
     context: {
       client: {
-        hl: 'en', gl: 'US', visitorData,
+        hl: lang, gl: LANG_TO_GL[lang] || 'US', visitorData,
         clientName: client.clientName, clientVersion: client.clientVersion,
         ...client.extra,
       },
@@ -94,7 +99,7 @@ function buildPlayerBody(videoId, visitorData, poToken, client) {
   return body;
 }
 
-async function fetchPlayer(videoId, visitorData, poToken, client) {
+async function fetchPlayer(videoId, visitorData, poToken, client, lang = 'en') {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 8000);
   try {
@@ -108,7 +113,7 @@ async function fetchPlayer(videoId, visitorData, poToken, client) {
           'X-Youtube-Client-Name': client.id,
           'X-Youtube-Client-Version': client.clientVersion,
         },
-        body: JSON.stringify(buildPlayerBody(videoId, visitorData, poToken, client)),
+        body: JSON.stringify(buildPlayerBody(videoId, visitorData, poToken, client, lang)),
         signal: controller.signal,
       }
     );
@@ -156,7 +161,7 @@ function extractResult(sd) {
   return null;
 }
 
-async function resolveYouTube(youtubeKey, db) {
+async function resolveYouTube(youtubeKey, db, lang = 'en') {
   if (!youtubeKey) return null;
 
   // Check D1 cache (cached trailer URLs, not tokens)
@@ -168,7 +173,7 @@ async function resolveYouTube(youtubeKey, db) {
     try {
       const visitorData = generateVisitorData();
       const poToken = generateColdStartToken(visitorData);
-      const data = await fetchPlayer(youtubeKey, visitorData, poToken, client);
+      const data = await fetchPlayer(youtubeKey, visitorData, poToken, client, lang);
       if (!data) continue;
 
       const status = data.playabilityStatus?.status;
@@ -230,8 +235,8 @@ export default {
 
     try {
       if (pathname === '/resolve' && request.method === 'POST') {
-        const { key } = await request.json();
-        const result = await resolveYouTube(key, env.DB);
+        const { key, lang } = await request.json();
+        const result = await resolveYouTube(key, env.DB, lang || 'en');
         return new Response(JSON.stringify(result), { headers });
       }
 
