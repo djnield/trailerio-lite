@@ -6,7 +6,7 @@
 // Language configuration - add a new language by adding one line
 const LANG_CONFIG = {
   en: { appleCountry: 'us', mubiCountry: 'US', label: 'English' },
-  fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|VOSTFR/i },
+  fr: { appleCountry: 'fr', mubiCountry: 'FR', label: 'Français', localSources: ['allocine'], dubbedRe: /\bVF\b/i, originalRe: /\bVO\b|\bSTFR\b|VOSTFR/i },
   de: { appleCountry: 'de', mubiCountry: 'DE', label: 'Deutsch', localSources: ['filmstarts'], dubbedRe: /\bDF\b|deutsch/i, originalRe: /\bOV\b|\bOmU\b/i },
   it: { appleCountry: 'it', mubiCountry: 'IT', label: 'Italiano', localSources: ['mymovies'], dubbedRe: /italiano|\bita\b/i, originalRe: /\bVO\b|\bOV\b|originale|sottotitol/i },
   es: { appleCountry: 'es', mubiCountry: 'ES', label: 'Español', localSources: ['sensacine'] },
@@ -748,8 +748,8 @@ const decodeEntities = s => s.replace(/&quot;/g, '"').replace(/&amp;/g, '&').rep
 function pickBestVersion(pool, dubbedRe, originalRe) {
   const dubbed = pool.find(e => dubbedRe && dubbedRe.test(e.title));
   const nonOrig = pool.find(e => !originalRe || !originalRe.test(e.title));
-  // Prefer dubbed → non-original → any available (fallback to VO if nothing else)
-  const best = dubbed || nonOrig || pool[0];
+  // Prefer dubbed → non-original → null (don't serve VO from localized sources)
+  const best = dubbed || nonOrig || null;
   return { best, dubbed: !!dubbed };
 }
 
