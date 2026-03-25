@@ -123,7 +123,21 @@ async function fetchPlayer(videoId, visitorData, poToken, client) {
 // ============== YOUTUBE RESOLVER ==============
 
 function extractResult(sd) {
-  // Priority 1: Muxed MP4 (video+audio, direct play)
+  // Priority 1: HLS manifest (adaptive 1080p+, single URL)
+  if (sd.hlsManifestUrl) {
+    const adaptive = (sd.adaptiveFormats || [])
+      .filter(f => f.mimeType?.startsWith('video/'))
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    const best = adaptive[0];
+    return {
+      url: sd.hlsManifestUrl,
+      provider: `YouTube ${best?.qualityLabel || 'HLS'}`,
+      bitrate: best?.bitrate ? Math.round(best.bitrate / 1000) : 0,
+      width: best?.width || 0, height: best?.height || 0,
+    };
+  }
+
+  // Priority 2: Muxed MP4 fallback (360p max, only if no HLS)
   const formats = sd.formats || [];
   let bestMuxed = null;
   for (const f of formats) {
@@ -137,20 +151,6 @@ function extractResult(sd) {
       provider: `YouTube ${bestMuxed.qualityLabel || bestMuxed.height + 'p'}`,
       bitrate: Math.round((bestMuxed.bitrate || 0) / 1000),
       width: bestMuxed.width, height: bestMuxed.height,
-    };
-  }
-
-  // Priority 2: HLS manifest (AVFoundation native)
-  if (sd.hlsManifestUrl) {
-    const adaptive = (sd.adaptiveFormats || [])
-      .filter(f => f.mimeType?.startsWith('video/'))
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
-    const best = adaptive[0];
-    return {
-      url: sd.hlsManifestUrl,
-      provider: `YouTube ${best?.qualityLabel || 'HLS'}`,
-      bitrate: best?.bitrate ? Math.round(best.bitrate / 1000) : 0,
-      width: best?.width || 0, height: best?.height || 0,
     };
   }
   return null;
