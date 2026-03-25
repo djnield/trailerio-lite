@@ -73,31 +73,6 @@ const CLIENTS = [
   },
 ];
 
-// ============== OAUTH TOKEN MANAGEMENT ==============
-
-const OAUTH_CLIENT_ID = '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com';
-const OAUTH_CLIENT_SECRET = 'SboVhoG9s0rNafixCSGGKXAT';
-
-// In-memory token cache (lives until worker eviction, ~5-30 min)
-let cachedAccessToken = null;
-let tokenExpiresAt = 0;
-
-async function getAccessToken(refreshToken) {
-  if (cachedAccessToken && Date.now() < tokenExpiresAt) return cachedAccessToken;
-
-  const resp = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `client_id=${OAUTH_CLIENT_ID}&client_secret=${OAUTH_CLIENT_SECRET}&refresh_token=${refreshToken}&grant_type=refresh_token`,
-  });
-  const data = await resp.json();
-  if (!data.access_token) return null;
-
-  cachedAccessToken = data.access_token;
-  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh 60s early
-  return cachedAccessToken;
-}
-
 // ============== PLAYER FETCH ==============
 
 function buildPlayerBody(videoId, visitorData, poToken, client) {
@@ -119,25 +94,20 @@ function buildPlayerBody(videoId, visitorData, poToken, client) {
   return body;
 }
 
-async function fetchPlayer(videoId, visitorData, poToken, client, accessToken) {
+async function fetchPlayer(videoId, visitorData, poToken, client) {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 8000);
   try {
-    const hdrs = {
-      'Content-Type': 'application/json',
-      'User-Agent': client.ua,
-      'X-Goog-Visitor-Id': visitorData,
-      'X-Youtube-Client-Name': client.id,
-      'X-Youtube-Client-Version': client.clientVersion,
-    };
-    // OAuth Bearer token for authenticated requests
-    if (accessToken) {
-      hdrs['Authorization'] = `Bearer ${accessToken}`;
-    }
     const resp = await fetch(
       `https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json&key=${INNERTUBE_KEY}`, {
         method: 'POST',
-        headers: hdrs,
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': client.ua,
+          'X-Goog-Visitor-Id': visitorData,
+          'X-Youtube-Client-Name': client.id,
+          'X-Youtube-Client-Version': client.clientVersion,
+        },
         body: JSON.stringify(buildPlayerBody(videoId, visitorData, poToken, client)),
         signal: controller.signal,
       }
@@ -186,38 +156,14 @@ function extractResult(sd) {
   return null;
 }
 
-async function resolveYouTube(youtubeKey, db, refreshToken) {
+async function resolveYouTube(youtubeKey, db) {
   if (!youtubeKey) return null;
 
   // Check D1 cache (cached trailer URLs, not tokens)
   const cached = await d1Get(db, `yt:v2:${youtubeKey}`);
   if (cached) return cached;
 
-  // Get OAuth access token if refresh token is configured
-  const accessToken = refreshToken ? await getAccessToken(refreshToken) : null;
-
-  // Priority 1: Authenticated Apple clients (OAuth + HLS 1080p+)
-  if (accessToken) {
-    for (const client of CLIENTS) {
-      try {
-        const visitorData = generateVisitorData();
-        const poToken = generateColdStartToken(visitorData);
-        const data = await fetchPlayer(youtubeKey, visitorData, poToken, client, accessToken);
-        if (!data) continue;
-
-        const status = data.playabilityStatus?.status;
-        if (status !== 'OK' || !data.streamingData) continue;
-
-        const result = extractResult(data.streamingData);
-        if (result) {
-          await d1Set(db, `yt:v2:${youtubeKey}`, result, 21600);
-          return result;
-        }
-      } catch { /* try next client */ }
-    }
-  }
-
-  // Priority 2: Anonymous Apple clients (fallback)
+  // Apple clients with cold-start tokens — all return HLS 1080p+
   for (const client of CLIENTS) {
     try {
       const visitorData = generateVisitorData();
@@ -242,30 +188,9 @@ async function resolveYouTube(youtubeKey, db, refreshToken) {
 
 // ============== DEBUG ENDPOINT ==============
 
-async function resolveYouTubeDebug(videoId, db, refreshToken) {
-  const accessToken = refreshToken ? await getAccessToken(refreshToken) : null;
-  const stages = { videoId, timestamp: new Date().toISOString(), oauth: !!accessToken, clients: {} };
+async function resolveYouTubeDebug(videoId, db) {
+  const stages = { videoId, timestamp: new Date().toISOString(), clients: {} };
 
-  // Test authenticated Apple clients
-  if (accessToken) {
-    for (const client of CLIENTS) {
-      const visitorData = generateVisitorData();
-      const poToken = generateColdStartToken(visitorData);
-      const data = await fetchPlayer(videoId, visitorData, poToken, client, accessToken);
-      if (!data) { stages.clients[`${client.name}_AUTH`] = { error: 'fetch failed' }; continue; }
-
-      const sd = data.streamingData;
-      stages.clients[`${client.name}_AUTH`] = {
-        playability: data.playabilityStatus?.status || 'unknown',
-        reason: data.playabilityStatus?.reason || null,
-        muxedFormats: sd?.formats?.length || 0,
-        adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
-        hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
-      };
-    }
-  }
-
-  // Test anonymous Apple clients
   for (const client of CLIENTS) {
     const visitorData = generateVisitorData();
     const poToken = generateColdStartToken(visitorData);
@@ -282,7 +207,7 @@ async function resolveYouTubeDebug(videoId, db, refreshToken) {
     };
   }
 
-  const result = await resolveYouTube(videoId, db, refreshToken);
+  const result = await resolveYouTube(videoId, db);
   stages.resolverResult = result ? result.provider : 'null';
   return stages;
 }
@@ -304,17 +229,15 @@ export default {
     const pathname = url.pathname;
 
     try {
-      const refreshToken = env.YOUTUBE_REFRESH_TOKEN || null;
-
       if (pathname === '/resolve' && request.method === 'POST') {
         const { key } = await request.json();
-        const result = await resolveYouTube(key, env.DB, refreshToken);
+        const result = await resolveYouTube(key, env.DB);
         return new Response(JSON.stringify(result), { headers });
       }
 
       const debugMatch = pathname.match(/^\/debug\/(.+)$/);
       if (debugMatch) {
-        const result = await resolveYouTubeDebug(debugMatch[1], env.DB, refreshToken);
+        const result = await resolveYouTubeDebug(debugMatch[1], env.DB);
         return new Response(JSON.stringify(result, null, 2), { headers });
       }
 
