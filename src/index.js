@@ -669,7 +669,7 @@ async function resolveYouTube(youtubeKey, env, lang = 'en') {
   if (!youtubeKey || !env.YOUTUBE) return null;
   try {
     const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 8000);
+    const tid = setTimeout(() => controller.abort(), 14000);
     const resp = await env.YOUTUBE.fetch(new Request('https://youtube/resolve', {
       method: 'POST',
       body: JSON.stringify({ key: youtubeKey, lang }),

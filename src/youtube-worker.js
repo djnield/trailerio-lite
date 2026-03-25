@@ -101,7 +101,7 @@ function buildPlayerBody(videoId, visitorData, poToken, client, lang = 'en') {
 
 async function fetchPlayer(videoId, visitorData, poToken, client, lang = 'en') {
   const controller = new AbortController();
-  const tid = setTimeout(() => controller.abort(), 8000);
+  const tid = setTimeout(() => controller.abort(), 4000);
   try {
     const resp = await fetch(
       `https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json&key=${INNERTUBE_KEY}`, {
