@@ -1141,6 +1141,55 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
   return result;
 }
 
+// ============== CACHE PRE-WARMER ==============
+
+async function prewarmCache(env) {
+  const db = env.DB;
+  const cache = caches.default;
+  const lang = 'en';
+
+  const lists = await Promise.all([
+    fetch(`https://api.themoviedb.org/3/movie/popular?api_key=${TMDB_API_KEY}`).then(r => r.json()).catch(() => ({})),
+    fetch(`https://api.themoviedb.org/3/movie/now_playing?api_key=${TMDB_API_KEY}`).then(r => r.json()).catch(() => ({})),
+    fetch(`https://api.themoviedb.org/3/tv/popular?api_key=${TMDB_API_KEY}`).then(r => r.json()).catch(() => ({})),
+    fetch(`https://api.themoviedb.org/3/trending/all/week?api_key=${TMDB_API_KEY}`).then(r => r.json()).catch(() => ({})),
+  ]);
+
+  const seen = new Set();
+  const items = [];
+  for (const list of lists) {
+    for (const item of (list.results || [])) {
+      const type = item.media_type === 'tv' || item.first_air_date ? 'series' : 'movie';
+      const key = `${type}:${item.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ tmdbId: item.id, type });
+    }
+  }
+
+  let count = 0;
+  for (const { tmdbId, type } of items) {
+    if (count >= 40) break;
+    try {
+      const endpoint = type === 'series' ? 'tv' : 'movie';
+      const extRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`);
+      const ext = await extRes.json();
+      const imdbId = ext.imdb_id;
+      if (!imdbId) continue;
+
+      const cacheKey = `trailer:v68:${lang}:${imdbId}`;
+      const existing = await d1Get(db, cacheKey);
+      if (existing) continue;
+
+      const baseKey = `base:${lang}:${imdbId}`;
+      await resolveTrailersFull(imdbId, type, cache, lang, env, null, cacheKey, baseKey, db);
+      count++;
+
+      await new Promise(r => setTimeout(r, 1500));
+    } catch { /* skip failed titles */ }
+  }
+}
+
 // ============== REQUEST HANDLER ==============
 
 export default {
@@ -1219,5 +1268,8 @@ export default {
         headers: corsHeaders
       });
     }
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(prewarmCache(env));
   }
 };

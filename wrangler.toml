@@ -11,3 +11,6 @@ database_id = "4e88de1b-0473-4078-9edb-437989ab33e9"
 [[services]]
 binding = "YOUTUBE"
 service = "trailerio-youtube"
+
+[triggers]
+crons = ["*/30 * * * *"]
