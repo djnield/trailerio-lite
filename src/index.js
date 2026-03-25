@@ -895,7 +895,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, env = {}) {
+async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, env = {}, ctx = null) {
   const db = env.DB || null;
   const cacheKey = `trailer:v67:${lang}:${imdbId}`;
   if (!fresh) {
@@ -1057,18 +1057,40 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
   const result = {
     title: metaResult?.tmdbMeta?.title || imdbId,
     links: links,
-    ...(youtubeFailed && ytErrors.length > 0 && { _ytDebug: ytErrors }),
   };
 
   if (links.length > 0) {
-    // If YouTube was expected but failed (cold-start), cache for only 5 minutes so it retries soon
-    const ttl = youtubeFailed ? 300 : CACHE_TTL;
     const response = new Response(JSON.stringify(result), {
-      headers: { 'Cache-Control': `max-age=${ttl}` }
+      headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
     });
     await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
-    // Persist in D1 (global, survives edge eviction)
-    d1Set(db, cacheKey, result, ttl);
+    d1Set(db, cacheKey, result, CACHE_TTL);
+  }
+
+  // Background retry: if YouTube failed, retry without time pressure and update cache
+  if (youtubeFailed && ctx) {
+    ctx.waitUntil((async () => {
+      try {
+        const keys = metaResult?.tmdbMeta?.youtubeKeys || [];
+        for (const key of keys) {
+          const ytResult = await resolveYouTube(key, env, lang);
+          if (ytResult && !ytResult._ytError) {
+            // Re-sort: YouTube on top, demote previous star
+            const updatedLinks = [
+              { trailers: ytResult.url, provider: `⭐ ${ytResult.provider}` },
+              ...links.map(l => ({ ...l, provider: l.provider.replace('⭐ ', '') }))
+            ];
+            const updatedResult = { title: result.title, links: updatedLinks };
+            const resp = new Response(JSON.stringify(updatedResult), {
+              headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
+            });
+            await cache.put(new Request(`https://cache/${cacheKey}`), resp);
+            await d1Set(db, cacheKey, updatedResult, CACHE_TTL);
+            return;
+          }
+        }
+      } catch { /* background retry failed silently */ }
+    })());
   }
 
   return result;
@@ -1128,7 +1150,7 @@ export default {
       const imdbId = id.split(':')[0];
       const fresh = url.searchParams.has('fresh');
 
-      const result = await resolveTrailers(imdbId, type, cache, lang, fresh, env);
+      const result = await resolveTrailers(imdbId, type, cache, lang, fresh, env, ctx);
 
       return new Response(JSON.stringify({
         meta: {
