@@ -42,6 +42,7 @@ function getManifest(lang) {
 const CACHE_TTL = 14400; // 4 hours max ceiling
 
 function isPermanentUrl(url) {
+  if (!url) return false;
   if (/\/expire\/\d+\//.test(url)) return false;    // YouTube
   if (/[?&]Expires=\d+/.test(url)) return false;     // IMDb
   if (/[?&]sec=/.test(url)) return false;             // Dailymotion HLS tokens
@@ -52,7 +53,8 @@ function getMinExpiry(links) {
   const now = Math.floor(Date.now() / 1000);
   let minExpiry = 0;
   for (const l of links) {
-    const url = l.trailers;
+    const url = l?.trailers;
+    if (!url) continue;
     const ytMatch = url.match(/\/expire\/(\d+)\//);
     if (ytMatch) { const e = parseInt(ytMatch[1]); if (!minExpiry || e < minExpiry) minExpiry = e; continue; }
     const imdbMatch = url.match(/[?&]Expires=(\d+)/);
