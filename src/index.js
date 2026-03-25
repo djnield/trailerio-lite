@@ -39,7 +39,21 @@ function getManifest(lang) {
   };
 }
 
-const CACHE_TTL = 14400; // 4 hours (YouTube HLS URLs expire in ~6h)
+const CACHE_TTL = 14400; // 4 hours max ceiling
+
+function getMinExpiry(links) {
+  const now = Math.floor(Date.now() / 1000);
+  let minExpiry = 0;
+  for (const l of links) {
+    const url = l.trailers;
+    const ytMatch = url.match(/\/expire\/(\d+)\//);
+    if (ytMatch) { const e = parseInt(ytMatch[1]); if (!minExpiry || e < minExpiry) minExpiry = e; continue; }
+    const imdbMatch = url.match(/[?&]Expires=(\d+)/);
+    if (imdbMatch) { const e = parseInt(imdbMatch[1]); if (!minExpiry || e < minExpiry) minExpiry = e; continue; }
+  }
+  if (!minExpiry || minExpiry <= now) return CACHE_TTL;
+  return Math.max(Math.min(minExpiry - now - 300, CACHE_TTL), 600);
+}
 const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
 const TVDB_API_KEY = 'e58cf7f7-2730-48e0-bff9-dc0bd6ab9d38';
 
@@ -1060,11 +1074,12 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
   };
 
   if (links.length > 0) {
+    const ttl = getMinExpiry(links);
     const response = new Response(JSON.stringify(result), {
-      headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
+      headers: { 'Cache-Control': `max-age=${ttl}` }
     });
     await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
-    d1Set(db, cacheKey, result, CACHE_TTL);
+    d1Set(db, cacheKey, result, ttl);
   }
 
   // Background retry: if YouTube failed, retry without time pressure and update cache
@@ -1081,11 +1096,12 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
               ...links.map(l => ({ ...l, provider: l.provider.replace('⭐ ', '') }))
             ];
             const updatedResult = { title: result.title, links: updatedLinks };
+            const bgTtl = getMinExpiry(updatedLinks);
             const resp = new Response(JSON.stringify(updatedResult), {
-              headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
+              headers: { 'Cache-Control': `max-age=${bgTtl}` }
             });
             await cache.put(new Request(`https://cache/${cacheKey}`), resp);
-            await d1Set(db, cacheKey, updatedResult, CACHE_TTL);
+            await d1Set(db, cacheKey, updatedResult, bgTtl);
             return;
           }
         }
