@@ -798,7 +798,7 @@ async function resolveWebedia(pageUrl, filmId, label, dubbedRe, originalRe) {
             } catch { return null; }
           })
         );
-        const videos = playerPages.filter(Boolean);
+        const videos = playerPages.filter(v => v && !junkVideo.test(v.title));
         if (videos.length > 0) {
           const { best, dubbed } = pickBestVersion(videos, dubbedRe, originalRe);
           if (!best) return null;
