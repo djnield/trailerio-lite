@@ -666,7 +666,7 @@ async function getTvdbYouTubeKey(imdbId, lang = 'en') {
 // ============== YOUTUBE (via service binding) ==============
 
 async function resolveYouTube(youtubeKey, env, lang = 'en') {
-  if (!youtubeKey || !env.YOUTUBE) return null;
+  if (!youtubeKey || !env.YOUTUBE) return { _ytError: `no_key_or_binding:${youtubeKey}` };
   try {
     const controller = new AbortController();
     const tid = setTimeout(() => controller.abort(), 14000);
@@ -676,11 +676,12 @@ async function resolveYouTube(youtubeKey, env, lang = 'en') {
       signal: controller.signal,
     }));
     clearTimeout(tid);
-    if (!resp.ok) return null;
+    if (!resp.ok) return { _ytError: `http_${resp.status}` };
     const data = await resp.json();
-    if (!data || data.error) return null;
+    if (!data) return { _ytError: 'null_response' };
+    if (data.error) return { _ytError: data.error };
     return data;
-  } catch { return null; }
+  } catch (e) { return { _ytError: `catch:${e?.message || 'unknown'}` }; }
 }
 
 function withTimeout(promise, ms) {
@@ -934,6 +935,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
 
   // ---------- ALL SOURCES IN PARALLEL (no phases, no waterfall) ----------
   let youtubeResult = null;
+  const ytErrors = [];
   const sources = [
     // IMDb - needs nothing, starts immediately
     resolveIMDb(imdbId),
@@ -947,6 +949,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
         // Try all TMDB keys (not just first — handles deleted/restricted videos)
         for (const key of keys) {
           const result = await resolveYouTube(key, env, lang);
+          if (result?._ytError) { ytErrors.push(`${key}:${result._ytError}`); continue; }
           if (result) { youtubeResult = result; return result; }
         }
 
@@ -1052,7 +1055,8 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
 
   const result = {
     title: metaResult?.tmdbMeta?.title || imdbId,
-    links: links
+    links: links,
+    ...(youtubeFailed && ytErrors.length > 0 && { _ytDebug: ytErrors }),
   };
 
   if (links.length > 0) {
