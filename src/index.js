@@ -39,7 +39,7 @@ function getManifest(lang) {
   };
 }
 
-const CACHE_TTL = 86400; // 24 hours
+const CACHE_TTL = 14400; // 4 hours (YouTube HLS URLs expire in ~6h)
 const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
 const TVDB_API_KEY = 'e58cf7f7-2730-48e0-bff9-dc0bd6ab9d38';
 
@@ -897,7 +897,7 @@ function deferred() {
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, env = {}, ctx = null) {
   const db = env.DB || null;
-  const cacheKey = `trailer:v67:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v68:${lang}:${imdbId}`;
   if (!fresh) {
     // Check edge cache first (fastest, per-PoP)
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
