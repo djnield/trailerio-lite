@@ -885,7 +885,7 @@ function deferred() {
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, env = {}) {
   const db = env.DB || null;
-  const cacheKey = `trailer:v66:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v67:${lang}:${imdbId}`;
   if (!fresh) {
     // Check edge cache first (fastest, per-PoP)
     const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
