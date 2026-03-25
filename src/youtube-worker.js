@@ -74,6 +74,14 @@ const CLIENTS = [
   },
 ];
 
+// WEB fallback — used with auth cookies when all Apple clients fail (LOGIN_REQUIRED)
+const WEB_CLIENT = {
+  name: 'WEB_AUTH', id: '1',
+  clientName: 'WEB', clientVersion: '2.20250320.01.00',
+  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+  extra: { platform: 'DESKTOP', browserName: 'Chrome', browserVersion: '134.0.0.0', osName: 'Windows', osVersion: '10.0' },
+};
+
 // ============== SAPISIDHASH AUTH ==============
 
 async function generateSapisidHash(sapisid) {
@@ -197,23 +205,7 @@ async function resolveYouTube(youtubeKey, db, cookieMap) {
   const cached = await d1Get(db, `yt:v2:${youtubeKey}`);
   if (cached) return cached;
 
-  // Priority 1: iOS with auth (HLS 1080p+ with auth reliability)
-  if (cookieMap?.SAPISID) {
-    try {
-      const visitorData = generateVisitorData();
-      const poToken = generateColdStartToken(visitorData);
-      const data = await fetchPlayer(youtubeKey, visitorData, poToken, CLIENTS[0], cookieMap);
-      if (data?.playabilityStatus?.status === 'OK' && data.streamingData) {
-        const result = extractResult(data.streamingData);
-        if (result) {
-          await d1Set(db, `yt:v2:${youtubeKey}`, result, 21600);
-          return result;
-        }
-      }
-    } catch { /* fall through to anonymous clients */ }
-  }
-
-  // Priority 2: Anonymous clients — fresh visitor per attempt (different rate limit pools)
+  // Priority 1: Apple clients (iOS/tvOS/iPadOS) — all return HLS 1080p+
   for (const client of CLIENTS) {
     try {
       const visitorData = generateVisitorData();
@@ -233,6 +225,21 @@ async function resolveYouTube(youtubeKey, db, cookieMap) {
     } catch { /* try next client */ }
   }
 
+  // Priority 2: WEB + auth fallback (for LOGIN_REQUIRED cases)
+  if (cookieMap?.SAPISID) {
+    try {
+      const visitorData = generateVisitorData();
+      const data = await fetchPlayer(youtubeKey, visitorData, null, WEB_CLIENT, cookieMap);
+      if (data?.playabilityStatus?.status === 'OK' && data.streamingData) {
+        const result = extractResult(data.streamingData);
+        if (result) {
+          await d1Set(db, `yt:v2:${youtubeKey}`, result, 21600);
+          return result;
+        }
+      }
+    } catch { /* silent */ }
+  }
+
   return null;
 }
 
@@ -240,23 +247,6 @@ async function resolveYouTube(youtubeKey, db, cookieMap) {
 
 async function resolveYouTubeDebug(videoId, db, cookieMap) {
   const stages = { videoId, timestamp: new Date().toISOString(), auth: !!cookieMap?.SAPISID, clients: {} };
-
-  // Test iOS with auth if available
-  if (cookieMap?.SAPISID) {
-    try {
-      const visitorData = generateVisitorData();
-      const poToken = generateColdStartToken(visitorData);
-      const data = await fetchPlayer(videoId, visitorData, poToken, CLIENTS[0], cookieMap);
-      const sd = data?.streamingData;
-      stages.clients['IOS_AUTH'] = {
-        playability: data?.playabilityStatus?.status || 'unknown',
-        reason: data?.playabilityStatus?.reason || null,
-        muxedFormats: sd?.formats?.length || 0,
-        adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
-        hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
-      };
-    } catch (e) { stages.clients['IOS_AUTH'] = { error: e.message }; }
-  }
 
   for (const client of CLIENTS) {
     const visitorData = generateVisitorData();
@@ -272,6 +262,22 @@ async function resolveYouTubeDebug(videoId, db, cookieMap) {
       adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
       hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
     };
+  }
+
+  // Test WEB + auth fallback
+  if (cookieMap?.SAPISID) {
+    try {
+      const visitorData = generateVisitorData();
+      const data = await fetchPlayer(videoId, visitorData, null, WEB_CLIENT, cookieMap);
+      const sd = data?.streamingData;
+      stages.clients['WEB_AUTH'] = {
+        playability: data?.playabilityStatus?.status || 'unknown',
+        reason: data?.playabilityStatus?.reason || null,
+        muxedFormats: sd?.formats?.length || 0,
+        adaptiveFormats: (sd?.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/')).length,
+        hlsManifestUrl: sd?.hlsManifestUrl ? 'yes' : 'no',
+      };
+    } catch (e) { stages.clients['WEB_AUTH'] = { error: e.message }; }
   }
 
   const result = await resolveYouTube(videoId, db, cookieMap);
