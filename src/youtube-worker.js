@@ -127,6 +127,18 @@ async function fetchPlayer(videoId, visitorData, poToken, client, lang = 'en') {
 
 // ============== YOUTUBE RESOLVER ==============
 
+function getUrlExpiry(url) {
+  if (!url) return 0;
+  const pathMatch = url.match(/\/expire\/(\d+)\//);
+  if (pathMatch) return parseInt(pathMatch[1]);
+  try {
+    const u = new URL(url);
+    const e = u.searchParams.get('expire');
+    if (e) return parseInt(e);
+  } catch {}
+  return 0;
+}
+
 function extractResult(sd) {
   // Priority 1: HLS manifest (adaptive 1080p+, single URL)
   if (sd.hlsManifestUrl) {
@@ -182,7 +194,10 @@ async function resolveYouTube(youtubeKey, db, lang = 'en') {
 
       const result = extractResult(data.streamingData);
       if (result) {
-        await d1Set(db, `yt:v2:${youtubeKey}`, result, 21600);
+        const expiry = getUrlExpiry(result.url);
+        const now = Math.floor(Date.now() / 1000);
+        const ttl = expiry > now ? Math.max(expiry - now - 300, 600) : 7200;
+        await d1Set(db, `yt:v2:${youtubeKey}`, result, ttl);
         return result;
       }
     } catch { /* try next client */ }
