@@ -181,16 +181,18 @@ async function resolveYouTube(youtubeKey, db, lang = 'en') {
   if (cached) return cached;
 
   // Apple clients with cold-start tokens — all return HLS 1080p+
+  let lastStatus = 'no_response';
   for (const client of CLIENTS) {
     try {
       const visitorData = generateVisitorData();
       const poToken = generateColdStartToken(visitorData);
       const data = await fetchPlayer(youtubeKey, visitorData, poToken, client, lang);
-      if (!data) continue;
+      if (!data) { lastStatus = 'fetch_failed'; continue; }
 
       const status = data.playabilityStatus?.status;
-      if (status === 'LOGIN_REQUIRED' || status === 'ERROR') continue;
-      if (status !== 'OK' || !data.streamingData) continue;
+      if (status === 'LOGIN_REQUIRED') { lastStatus = 'login_required'; continue; }
+      if (status === 'ERROR') { lastStatus = data.playabilityStatus?.reason || 'error'; continue; }
+      if (status !== 'OK' || !data.streamingData) { lastStatus = status || 'no_streaming_data'; continue; }
 
       const result = extractResult(data.streamingData);
       if (result) {
@@ -200,10 +202,11 @@ async function resolveYouTube(youtubeKey, db, lang = 'en') {
         await d1Set(db, `yt:v2:${youtubeKey}`, result, ttl);
         return result;
       }
-    } catch { /* try next client */ }
+      lastStatus = 'no_extractable_format';
+    } catch { lastStatus = 'exception'; }
   }
 
-  return null;
+  return { error: lastStatus };
 }
 
 // ============== DEBUG ENDPOINT ==============
@@ -228,7 +231,7 @@ async function resolveYouTubeDebug(videoId, db) {
   }
 
   const result = await resolveYouTube(videoId, db);
-  stages.resolverResult = result ? result.provider : 'null';
+  stages.resolverResult = result?.error ? `FAILED: ${result.error}` : (result?.provider || 'null');
   return stages;
 }
 

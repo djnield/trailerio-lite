@@ -677,7 +677,9 @@ async function resolveYouTube(youtubeKey, env, lang = 'en') {
     }));
     clearTimeout(tid);
     if (!resp.ok) return null;
-    return await resp.json();
+    const data = await resp.json();
+    if (!data || data.error) return null;
+    return data;
   } catch { return null; }
 }
 
