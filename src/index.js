@@ -1076,7 +1076,7 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
   const isLocalized = lang !== 'en';
   const seen = new Set();
   const links = allResults
-    .filter(r => r !== null)
+    .filter(r => r !== null && r !== undefined && r?.url)
     .sort((a, b) => {
       if (isLocalized) {
         if (a.localized && !b.localized) return -1;
