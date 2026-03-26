@@ -156,6 +156,8 @@ function extractResult(sd) {
       .filter(f => f.mimeType?.startsWith('video/'))
       .sort((a, b) => (b.height || 0) - (a.height || 0));
     const best = adaptive[0];
+    // Reject vertical videos (YouTube Shorts)
+    if (best?.width > 0 && best?.height > 0 && best.height > best.width) return null;
     return {
       url: sd.hlsManifestUrl,
       provider: `YouTube ${best?.qualityLabel || 'HLS'}`,
@@ -173,6 +175,8 @@ function extractResult(sd) {
     }
   }
   if (bestMuxed) {
+    // Reject vertical videos (YouTube Shorts)
+    if (bestMuxed.width > 0 && bestMuxed.height > bestMuxed.width) return null;
     return {
       url: bestMuxed.url,
       provider: `YouTube ${bestMuxed.qualityLabel || bestMuxed.height + 'p'}`,

@@ -163,7 +163,7 @@ async function getTMDBMetadata(imdbId, type = 'movie', lang = 'en', db = null) {
 
     // Pick YouTube trailer keys, preferring user's language then official trailers
     const ytVideos = (videosData.results || [])
-      .filter(v => v.site === 'YouTube' && v.key)
+      .filter(v => v.site === 'YouTube' && v.key && !/shorts/i.test(v.name || ''))
       .sort((a, b) => {
         const langScore = v => (v.iso_639_1 === lang ? 0 : v.iso_639_1 === 'en' ? 1 : 2);
         const typeScore = v => (v.type === 'Trailer' ? 0 : v.type === 'Teaser' ? 1 : 2);
