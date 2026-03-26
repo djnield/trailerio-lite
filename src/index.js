@@ -692,7 +692,7 @@ async function resolveYouTube(youtubeKey, env, lang = 'en') {
   if (!youtubeKey || !env.YOUTUBE) return { _ytError: `no_key_or_binding:${youtubeKey}` };
   try {
     const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 14000);
+    const tid = setTimeout(() => controller.abort(), 6000);
     const resp = await env.YOUTUBE.fetch(new Request('https://youtube/resolve', {
       method: 'POST',
       body: JSON.stringify({ key: youtubeKey, lang }),
@@ -984,16 +984,23 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
         const keys = tmdbMeta?.youtubeKeys || [];
         if (keys.length === 0) { ytErrors.push('no_tmdb_keys'); }
 
-        // Try all TMDB keys (not just first — handles deleted/restricted videos)
-        for (const keyInfo of keys) {
-          const key = typeof keyInfo === 'string' ? keyInfo : keyInfo.key;
-          const keyLang = typeof keyInfo === 'string' ? null : keyInfo.lang;
-          const result = await resolveYouTube(key, env, lang);
-          if (result?._ytError) { ytErrors.push(`${key}:${result._ytError}`); continue; }
-          if (result) {
-            if (lang !== 'en' && keyLang === lang) result.localized = true;
-            youtubeResult = result; return result;
-          }
+        // Race all TMDB keys in parallel — first success wins
+        if (keys.length > 0) {
+          try {
+            const { result, keyInfo } = await Promise.any(keys.map(ki => {
+              const key = typeof ki === 'string' ? ki : ki.key;
+              return resolveYouTube(key, env, lang).then(r => {
+                if (r?._ytError) throw new Error(r._ytError);
+                if (!r) throw new Error('null');
+                return { result: r, keyInfo: ki };
+              });
+            }));
+            if (result) {
+              const keyLang = typeof keyInfo === 'string' ? null : keyInfo.lang;
+              if (lang !== 'en' && keyLang === lang) result.localized = true;
+              youtubeResult = result; return result;
+            }
+          } catch (e) { ytErrors.push(`all_keys_failed:${e?.errors?.map(e=>e.message).join(',') || e?.message || 'unknown'}`); }
         }
 
         // TMDB keys failed/empty — AniList + TVDB parallel fallback
@@ -1121,10 +1128,18 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
     ctx.waitUntil((async () => {
       try {
         const keys = metaResult?.tmdbMeta?.youtubeKeys || [];
-        for (const keyInfo of keys) {
-          const key = typeof keyInfo === 'string' ? keyInfo : keyInfo.key;
-          const ytResult = await resolveYouTube(key, env, lang);
-          if (ytResult && !ytResult._ytError) {
+        // Race all keys in parallel for background retry too
+        let ytResult = null;
+        try {
+          ytResult = await Promise.any(keys.map(ki => {
+            const key = typeof ki === 'string' ? ki : ki.key;
+            return resolveYouTube(key, env, lang).then(r => {
+              if (r?._ytError || !r) throw new Error('failed');
+              return r;
+            });
+          }));
+        } catch {}
+        if (ytResult) {
             // Re-sort: YouTube on top, demote previous star
             const updatedLinks = [
               { trailers: ytResult.url, provider: `⭐ ${ytResult.provider}` },
@@ -1137,9 +1152,7 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
             });
             await cache.put(new Request(`https://cache/${cacheKey}`), resp);
             await d1Set(db, cacheKey, updatedResult, bgTtl);
-            return;
           }
-        }
       } catch { /* background retry failed silently */ }
     })());
   }
