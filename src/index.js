@@ -982,21 +982,47 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
 
         // Race all TMDB keys in parallel — first success wins
         if (keys.length > 0) {
+          // Race all keys — prefer HLS, reject muxed MP4
+          const resolveAll = keys.map(ki => {
+            const key = typeof ki === 'string' ? ki : ki.key;
+            return resolveYouTube(key, env, lang).then(r => {
+              if (r?._ytError || !r) throw new Error(r?._ytError || 'null');
+              return { result: r, keyInfo: ki };
+            });
+          });
+
+          // First try: only accept HLS results
           try {
-            const { result, keyInfo } = await Promise.any(keys.map(ki => {
-              const key = typeof ki === 'string' ? ki : ki.key;
-              return resolveYouTube(key, env, lang).then(r => {
-                if (r?._ytError) throw new Error(r._ytError);
-                if (!r) throw new Error('null');
-                return { result: r, keyInfo: ki };
-              });
-            }));
+            const { result, keyInfo } = await Promise.any(resolveAll.map(p =>
+              p.then(({ result, keyInfo }) => {
+                if (result.url && !result.url.includes('.m3u8') && !result.url.includes('manifest'))
+                  throw new Error('muxed_mp4');
+                return { result, keyInfo };
+              })
+            ));
             if (result) {
               const keyLang = typeof keyInfo === 'string' ? null : keyInfo.lang;
               if (lang !== 'en' && keyLang === lang) result.localized = true;
               youtubeResult = result; return result;
             }
-          } catch (e) { ytErrors.push(`all_keys_failed:${e?.errors?.map(e=>e.message).join(',') || e?.message || 'unknown'}`); }
+          } catch {}
+
+          // Second try: accept any result (including muxed MP4) as fallback
+          try {
+            const settled = await Promise.allSettled(resolveAll);
+            const best = settled
+              .filter(r => r.status === 'fulfilled')
+              .map(r => r.value)
+              .sort((a, b) => (b.result.height || 0) - (a.result.height || 0))[0];
+            if (best) {
+              const { result, keyInfo } = best;
+              const keyLang = typeof keyInfo === 'string' ? null : keyInfo.lang;
+              if (lang !== 'en' && keyLang === lang) result.localized = true;
+              youtubeResult = result; return result;
+            }
+          } catch {}
+
+          ytErrors.push('all_keys_failed');
         }
 
         // TMDB keys failed/empty — AniList + TVDB parallel fallback
