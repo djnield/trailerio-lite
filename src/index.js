@@ -924,11 +924,7 @@ async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, 
   const baseKey = `base:${lang}:${imdbId}`;
 
   if (!fresh) {
-    // Check edge cache first (fastest, per-PoP)
-    const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
-    if (cached) return await cached.json();
-
-    // Fall back to D1 full cache (global, persistent)
+    // D1 cache (global, persistent)
     const d1Cached = await d1Get(db, cacheKey);
     if (d1Cached) return d1Cached;
 
@@ -1110,10 +1106,6 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
 
   if (links.length > 0) {
     const ttl = getMinExpiry(links);
-    const response = new Response(JSON.stringify(result), {
-      headers: { 'Cache-Control': `max-age=${ttl}` }
-    });
-    await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
     d1Set(db, cacheKey, result, ttl);
 
     // Cache permanent sources separately (30 days) for instant fallback
@@ -1147,10 +1139,6 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
             ];
             const updatedResult = { title: result.title, links: updatedLinks };
             const bgTtl = getMinExpiry(updatedLinks);
-            const resp = new Response(JSON.stringify(updatedResult), {
-              headers: { 'Cache-Control': `max-age=${bgTtl}` }
-            });
-            await cache.put(new Request(`https://cache/${cacheKey}`), resp);
             await d1Set(db, cacheKey, updatedResult, bgTtl);
           }
       } catch { /* background retry failed silently */ }
