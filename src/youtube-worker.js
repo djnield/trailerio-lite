@@ -73,6 +73,14 @@ const CLIENTS = [
   },
 ];
 
+// WEB client for cookie-authenticated requests (bypasses age restriction)
+const WEB_CLIENT = {
+  name: 'WEB', id: '1',
+  clientName: 'WEB', clientVersion: '2.20250325.01.00',
+  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  extra: { platform: 'DESKTOP' },
+};
+
 // ============== PLAYER FETCH ==============
 
 const LANG_TO_GL = {
@@ -99,20 +107,22 @@ function buildPlayerBody(videoId, visitorData, poToken, client, lang = 'en') {
   return body;
 }
 
-async function fetchPlayer(videoId, visitorData, poToken, client, lang = 'en') {
+async function fetchPlayer(videoId, visitorData, poToken, client, lang = 'en', cookies = '') {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 4000);
   try {
+    const headers = {
+      'Content-Type': 'application/json',
+      'User-Agent': client.ua,
+      'X-Goog-Visitor-Id': visitorData,
+      'X-Youtube-Client-Name': client.id,
+      'X-Youtube-Client-Version': client.clientVersion,
+    };
+    if (cookies) headers['Cookie'] = cookies;
     const resp = await fetch(
       `https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json&key=${INNERTUBE_KEY}`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': client.ua,
-          'X-Goog-Visitor-Id': visitorData,
-          'X-Youtube-Client-Name': client.id,
-          'X-Youtube-Client-Version': client.clientVersion,
-        },
+        headers,
         body: JSON.stringify(buildPlayerBody(videoId, visitorData, poToken, client, lang)),
         signal: controller.signal,
       }
@@ -173,7 +183,7 @@ function extractResult(sd) {
   return null;
 }
 
-async function resolveYouTube(youtubeKey, db, lang = 'en') {
+async function resolveYouTube(youtubeKey, db, lang = 'en', cookies = '') {
   if (!youtubeKey) return null;
 
   // Check D1 cache (cached trailer URLs, not tokens)
@@ -186,7 +196,7 @@ async function resolveYouTube(youtubeKey, db, lang = 'en') {
     try {
       const visitorData = generateVisitorData();
       const poToken = generateColdStartToken(visitorData);
-      const data = await fetchPlayer(youtubeKey, visitorData, poToken, client, lang);
+      const data = await fetchPlayer(youtubeKey, visitorData, poToken, client, lang, cookies);
       if (!data) { lastStatus = 'fetch_failed'; continue; }
 
       const status = data.playabilityStatus?.status;
@@ -204,6 +214,25 @@ async function resolveYouTube(youtubeKey, db, lang = 'en') {
       }
       lastStatus = 'no_extractable_format';
     } catch { lastStatus = 'exception'; }
+  }
+
+  // Retry with WEB client + cookies for age-restricted content
+  if (lastStatus === 'login_required' && cookies) {
+    try {
+      const visitorData = generateVisitorData();
+      const poToken = generateColdStartToken(visitorData);
+      const data = await fetchPlayer(youtubeKey, visitorData, poToken, WEB_CLIENT, lang, cookies);
+      if (data?.playabilityStatus?.status === 'OK' && data.streamingData) {
+        const result = extractResult(data.streamingData);
+        if (result) {
+          const expiry = getUrlExpiry(result.url);
+          const now = Math.floor(Date.now() / 1000);
+          const ttl = expiry > now ? Math.max(expiry - now - 300, 600) : 7200;
+          await d1Set(db, `yt:v2:${youtubeKey}`, result, ttl);
+          return result;
+        }
+      }
+    } catch {}
   }
 
   return { error: lastStatus };
@@ -254,7 +283,8 @@ export default {
     try {
       if (pathname === '/resolve' && request.method === 'POST') {
         const { key, lang } = await request.json();
-        const result = await resolveYouTube(key, env.DB, lang || 'en');
+        const cookies = env.YOUTUBE_COOKIES || '';
+        const result = await resolveYouTube(key, env.DB, lang || 'en', cookies);
         return new Response(JSON.stringify(result), { headers });
       }
 
