@@ -73,12 +73,12 @@ const CLIENTS = [
   },
 ];
 
-// WEB client for cookie-authenticated requests (bypasses age restriction)
+// iOS Safari client for cookie-authenticated requests (bypasses age restriction)
 const WEB_CLIENT = {
-  name: 'WEB', id: '1',
-  clientName: 'WEB', clientVersion: '2.20250325.01.00',
-  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  extra: { platform: 'DESKTOP' },
+  name: 'MWEB', id: '2',
+  clientName: 'MWEB', clientVersion: '2.20250325.01.00',
+  ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
+  extra: { platform: 'MOBILE' },
 };
 
 // ============== PLAYER FETCH ==============
