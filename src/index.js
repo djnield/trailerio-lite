@@ -920,7 +920,7 @@ function deferred() {
 
 async function resolveTrailers(imdbId, type, cache, lang = 'en', fresh = false, env = {}, ctx = null) {
   const db = env.DB || null;
-  const cacheKey = `trailer:v68:${lang}:${imdbId}`;
+  const cacheKey = `trailer:v69:${lang}:${imdbId}`;
   const baseKey = `base:${lang}:${imdbId}`;
 
   if (!fresh) {
@@ -1196,7 +1196,7 @@ async function prewarmCache(env) {
       const imdbId = ext.imdb_id;
       if (!imdbId) continue;
 
-      const cacheKey = `trailer:v68:${lang}:${imdbId}`;
+      const cacheKey = `trailer:v69:${lang}:${imdbId}`;
       const existing = await d1Get(db, cacheKey);
       if (existing) continue;
 
