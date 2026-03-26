@@ -986,10 +986,12 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
 
         // Try all TMDB keys (not just first — handles deleted/restricted videos)
         for (const keyInfo of keys) {
-          const result = await resolveYouTube(keyInfo.key, env, lang);
-          if (result?._ytError) { ytErrors.push(`${keyInfo.key}:${result._ytError}`); continue; }
+          const key = typeof keyInfo === 'string' ? keyInfo : keyInfo.key;
+          const keyLang = typeof keyInfo === 'string' ? null : keyInfo.lang;
+          const result = await resolveYouTube(key, env, lang);
+          if (result?._ytError) { ytErrors.push(`${key}:${result._ytError}`); continue; }
           if (result) {
-            if (lang !== 'en' && keyInfo.lang === lang) result.localized = true;
+            if (lang !== 'en' && keyLang === lang) result.localized = true;
             youtubeResult = result; return result;
           }
         }
@@ -1120,7 +1122,8 @@ async function resolveTrailersFull(imdbId, type, cache, lang, env, ctx, cacheKey
       try {
         const keys = metaResult?.tmdbMeta?.youtubeKeys || [];
         for (const keyInfo of keys) {
-          const ytResult = await resolveYouTube(keyInfo.key, env, lang);
+          const key = typeof keyInfo === 'string' ? keyInfo : keyInfo.key;
+          const ytResult = await resolveYouTube(key, env, lang);
           if (ytResult && !ytResult._ytError) {
             // Re-sort: YouTube on top, demote previous star
             const updatedLinks = [
